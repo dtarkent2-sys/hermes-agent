@@ -3,6 +3,18 @@
  * Enter submits, the input clears imperatively, and a live slash-completion
  * dropdown renders ABOVE it as you type `/…` (spec §1 completions).
  *
+ * Newlines: Shift+Enter inserts one on kitty-protocol terminals (ghostty/
+ * kitty/wezterm — legacy input can't distinguish it from Enter, both arrive as
+ * the CR byte, so plain Enter stays submit everywhere); Alt+Enter is the
+ * universal fallback (ESC-prefixed CR in legacy terminals), Ctrl+J too (the
+ * legacy linefeed byte keeps the stock `newline` binding). Height: the box
+ * auto-grows to COMPOSER_MAX_ROWS (Ink parity 8; HERMES_TUI_COMPOSER_ROWS
+ * overrides) then scrolls INTERNALLY — the native edit buffer keeps the cursor
+ * in view, Up/Down navigate lines in a multi-line buffer (history recall is a
+ * single-line affair), Home/End are per-line (Ctrl+Home/End jump the buffer),
+ * and a muted `line 12/40` indicator appears only while the buffer is taller
+ * than the cap.
+ *
  * Gotchas (§8 #3): `flexShrink:0` so it never collapses onto its rule; clear via
  * `.clear()` (NOT key-remount); a `submitting` re-entrancy guard.
  *
@@ -42,6 +54,7 @@ import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
 import { MENU_MAX, routeMenuKey } from '../logic/completionMenu.ts'
+import { envComposerRows } from '../logic/env.ts'
 import { createDoublePress } from '../logic/promptHistory.ts'
 import { analyzeSlash, learnableNames, nativeCharOffset } from '../logic/skillMatch.ts'
 import type { CompletionItem } from '../logic/store.ts'
@@ -127,9 +140,12 @@ export function Composer(props: {
 }) {
   const theme = useTheme()
   const dims = useDimensions()
-  // Auto-expand the input up to ~a third of the screen, then it scrolls internally
-  // (opencode's prompt: minHeight 1, maxHeight max(6, ⌊rows/3⌋)).
-  const maxHeight = () => Math.max(6, Math.floor(dims().height / 3))
+  // Auto-expand the input as you type, but cap the VISIBLE height at
+  // COMPOSER_MAX_ROWS (Ink parity: 8 lines; HERMES_TUI_COMPOSER_ROWS overrides) —
+  // beyond that the native edit buffer scrolls internally and keeps the cursor
+  // in view. Small screens still bound it to ~a third of the rows.
+  const capRows = envComposerRows(process.env.HERMES_TUI_COMPOSER_ROWS)
+  const maxHeight = () => Math.min(capRows, Math.max(3, Math.floor(dims().height / 3)))
   let ta: TextareaRenderable | undefined
   let submitting = false
   const completions = () => props.completions?.() ?? []
@@ -142,6 +158,10 @@ export function Composer(props: {
   // (completion batches arrive async, after the text changed).
   const [bufText, setBufText] = createSignal('')
   const [namesRev, setNamesRev] = createSignal(0)
+  // Cursor line / total lines (item 3): drives the quiet `line 12/40` indicator
+  // shown only while the buffer is taller than the visible cap (internal scroll).
+  const [cursorLine, setCursorLine] = createSignal(0)
+  const [lineTotal, setLineTotal] = createSignal(1)
   // Esc on the suggestion row parks it for THIS exact text; any edit re-arms.
   const [dismissedFor, setDismissedFor] = createSignal<string | undefined>(undefined)
   // Learn names from slash-completion batches (bare `/…` lead token only —
@@ -279,7 +299,19 @@ export function Composer(props: {
     submitting = false
   }
 
+  /** Refresh the line-indicator signals from the textarea (best-effort). */
+  const syncCursorLine = () => {
+    if (!ta || ta.isDestroyed) return
+    setCursorLine(ta.logicalCursor.row)
+    setLineTotal(ta.lineCount)
+  }
+
   useKeyboard(key => {
+    // line-indicator upkeep: plain cursor movement emits no native event, so
+    // sync AFTER this dispatch (the global handler runs before the textarea
+    // processes the key; the microtask runs after both). Equal-value signal
+    // sets are no-ops, so this is cheap on every keystroke.
+    queueMicrotask(syncCursorLine)
     // 0) double-Esc bookkeeping: any non-Esc press is an intervening key and
     // disarms the pending Esc (free-code resets on every other input).
     if (key.eventType !== 'release' && key.name !== 'escape') doubleEsc.reset()
@@ -348,21 +380,27 @@ export function Composer(props: {
       key.preventDefault()
       return
     }
-    // 3) prompt history (item 6): Up at the first line → older prompt; Down at the
-    // last line → newer/draft. At the boundary the textarea's own up/down is a
-    // no-op, so there's no conflict; mid-buffer it falls through to cursor moves.
-    // Gated on the textarea being FOCUSED: while focus is elsewhere (the agents
-    // tray, the transcript scrollbox) arrows must not recall history into the buffer.
+    // 3) prompt history (item 6): Up/Down recall older/newer prompts — but ONLY
+    // while the buffer is a SINGLE line (big-text navigation, item 3): in a
+    // multi-line buffer the arrows always fall through to the textarea's own
+    // cursor movement (the internal viewport follows the cursor), so a tall
+    // paste is never clobbered by a history recall. Modified arrows (Shift
+    // select-up, Ctrl/Alt word-ish moves) belong to the textarea too. Gated on
+    // the textarea being FOCUSED: while focus is elsewhere (the agents tray,
+    // the transcript scrollbox) arrows must not recall history into the buffer.
     if (ta?.focused && props.history) {
-      if (key.name === 'up' && ta.logicalCursor.row === 0) {
-        const entry = props.history.prev(ta.plainText)
-        if (entry !== null) setBuffer(entry)
-        return
-      }
-      if (key.name === 'down' && ta.logicalCursor.row === ta.lineCount - 1) {
-        const entry = props.history.next()
-        if (entry !== null) setBuffer(entry)
-        return
+      const unmodified = !key.ctrl && !key.meta && !key.option && !key.shift
+      if (unmodified && ta.lineCount <= 1) {
+        if (key.name === 'up') {
+          const entry = props.history.prev(ta.plainText)
+          if (entry !== null) setBuffer(entry)
+          return
+        }
+        if (key.name === 'down') {
+          const entry = props.history.next()
+          if (entry !== null) setBuffer(entry)
+          return
+        }
       }
       // any edit resets the recall cursor so the next Up starts from the bottom
       if (key.name === 'backspace' || key.name === 'delete' || isPrintableKey(key)) {
@@ -441,7 +479,30 @@ export function Composer(props: {
           placeholderColor={theme().color.muted}
           textColor={theme().color.text}
           cursorColor={theme().color.accent}
-          keyBindings={[{ action: 'submit', name: 'return' }]}
+          keyBindings={[
+            // Enter submits. LEGACY input can't tell Shift+Enter from Enter (both
+            // are the CR byte), so plain return must stay submit everywhere.
+            { action: 'submit', name: 'return' },
+            { action: 'submit', name: 'kpenter' },
+            // kitty-protocol terminals (ghostty/kitty/wezterm) report Shift on
+            // return as a distinct event → newline, the modern chat-input feel.
+            { action: 'newline', name: 'return', shift: true },
+            { action: 'newline', name: 'kpenter', shift: true },
+            // Alt+Enter: the UNIVERSAL newline fallback — legacy terminals send
+            // ESC-prefixed CR for it, so it works without kitty. (Overrides the
+            // stock meta+return submit, which plain Enter already covers. Ctrl+J
+            // — the legacy linefeed byte — also stays newline via the defaults.)
+            { action: 'newline', meta: true, name: 'return' },
+            { action: 'newline', meta: true, name: 'kpenter' },
+            // Home/End move PER LINE in a multi-line buffer (stock binds them to
+            // the buffer ends); Ctrl+Home/End keep the whole-buffer jumps.
+            { action: 'line-home', name: 'home' },
+            { action: 'line-end', name: 'end' },
+            { action: 'select-line-home', name: 'home', shift: true },
+            { action: 'select-line-end', name: 'end', shift: true },
+            { action: 'buffer-home', ctrl: true, name: 'home' },
+            { action: 'buffer-end', ctrl: true, name: 'end' }
+          ]}
           onMouseDown={() => ta?.focus()}
           onSubmit={submit}
           onPaste={(e: PasteEvent) => {
@@ -461,13 +522,26 @@ export function Composer(props: {
             }
             // small pastes fall through to the textarea's native insert
           }}
+          onCursorChange={() => syncCursorLine()}
           onContentChange={() => {
             const text = ta?.plainText ?? ''
             setBufText(text) // drives the token analysis (highlight + suggestion)
+            syncCursorLine()
             props.onType?.(text)
           }}
         />
       </box>
+      {/* quiet line indicator (item 3): only while the buffer is TALLER than the
+          visible cap (the textarea is scrolling internally), so the position in a
+          big paste isn't a mystery. Muted + right-aligned — input chrome, not
+          transcript content, hence selectable={false}. */}
+      <Show when={lineTotal() > maxHeight()}>
+        <box style={{ flexDirection: 'row', flexShrink: 0, justifyContent: 'flex-end' }}>
+          <text selectable={false} fg={theme().color.muted}>
+            {`line ${Math.min(cursorLine() + 1, lineTotal())}/${lineTotal()}`}
+          </text>
+        </box>
+      </Show>
     </box>
   )
 }

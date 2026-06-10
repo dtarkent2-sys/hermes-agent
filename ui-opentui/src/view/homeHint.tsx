@@ -194,7 +194,7 @@ export function HomeHint(props: { store: SessionStore }) {
       <box style={{ marginTop: 1 }}>
         <text selectable={false}>
           <span style={{ fg: theme().color.muted }}>
-            Type to chat · ↑↓ history · @file to mention · Ctrl+C to stop/quit
+            Type to chat · ↑↓ history · Alt+Enter newline · @file to mention · Ctrl+C to stop/quit
           </span>
         </text>
       </box>

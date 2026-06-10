@@ -32,6 +32,26 @@ export function envOutputLines(value: string | undefined): number {
 }
 
 /**
+ * Default visible-height cap for the composer textarea, in rows (Ink composer
+ * parity — 8 lines, ref feature request #10418). Beyond this the textarea
+ * scrolls INTERNALLY (the native edit buffer keeps the cursor in view).
+ */
+export const COMPOSER_MAX_ROWS = 8
+
+/**
+ * Parse `HERMES_TUI_COMPOSER_ROWS` (a TUI-only env var — deliberately NOT a
+ * config.yaml knob): the composer's visible-height cap before internal scroll
+ * kicks in. A positive integer → that cap; unset / `0` / garbage → the
+ * COMPOSER_MAX_ROWS default.
+ */
+export function envComposerRows(value: string | undefined): number {
+  const v = value?.trim() ?? ''
+  if (!/^\d+$/.test(v)) return COMPOSER_MAX_ROWS
+  const n = Number.parseInt(v, 10)
+  return n > 0 ? n : COMPOSER_MAX_ROWS
+}
+
+/**
  * Whether NO line cap applies (unset / `0` / unparseable). When unlimited,
  * the store prefers the always-full raw `result` over a gateway tail-capped
  * `result_text` — an "unlimited" view of a tail would still be missing its
