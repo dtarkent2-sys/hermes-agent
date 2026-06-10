@@ -1,13 +1,14 @@
 /**
  * App — the Solid view shell (spec v4 §2 `view/App.tsx`). Header + a content zone
  * that is either the PAGER overlay (long slash output) or the normal
- * transcript + input zone; the input zone is one of: blocking prompt, session
- * switcher, generic picker (model/skills), or the composer. Fully themed (§7.5).
+ * transcript + input zone; the input zone is one of: blocking prompt, resume
+ * picker (/sessions), generic picker (model/skills), or the composer. Fully
+ * themed (§7.5).
  *
  *   header     flexShrink:0            (top chrome line)
  *   content    flexGrow:1, minHeight:0 — Pager OR (transcript + input zone)
  *   transcript flexGrow:1, minHeight:0 (the one <scrollbox>; §8 #2 gotchas)
- *   input zone flexShrink:0            (PromptOverlay | SessionSwitcher | Picker | Composer)
+ *   input zone flexShrink:0            (PromptOverlay | SessionPicker | Picker | Composer)
  *
  * Overlays REPLACE rather than stack (a `<Switch>`), so the composer remounts +
  * refocuses when an overlay closes; the key that closed an overlay can't leak
@@ -28,7 +29,7 @@ import { AgentsDashboard } from './overlays/agentsDashboard.tsx'
 import { Pager } from './overlays/pager.tsx'
 import { Picker } from './overlays/picker.tsx'
 import { PromptHistory } from './overlays/promptHistory.tsx'
-import { SessionSwitcher } from './overlays/sessionSwitcher.tsx'
+import { SessionPicker, type SessionPickerOps } from './overlays/sessionPicker.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
 import { SessionInfoProvider } from './sessionInfo.tsx'
 import { StatusBar } from './statusBar.tsx'
@@ -42,6 +43,11 @@ export interface AppProps {
   readonly onType?: (text: string) => void
   readonly onRespond?: (method: string, params: Record<string, unknown>) => void
   readonly onResume?: (sessionId: string) => void
+  /** Gateway calls for the resume picker (session.list/peek/title). */
+  readonly sessionOps?: SessionPickerOps
+  /** Fired after the resume picker closes WITHOUT a pick (boot path: the
+   *  entry creates a fresh session when none exists yet). */
+  readonly onSessionPickerClosed?: () => void
   readonly sessionId?: () => string | undefined
   readonly history?: ComposerHistory
   readonly onImagePaste?: () => void
@@ -52,6 +58,12 @@ const NOOP = () => {}
 const NOOP_RESPOND = () => {}
 const NOOP_RESUME = () => {}
 const NO_SESSION = () => undefined
+/** Inert picker ops for headless mounts that pass no gateway (tests). */
+const NOOP_OPS: SessionPickerOps = {
+  list: () => Promise.resolve({ sessions: [], truncated: false }),
+  peek: () => Promise.resolve({}),
+  rename: () => Promise.resolve()
+}
 
 export function App(props: AppProps) {
   const theme = useTheme()
@@ -63,14 +75,19 @@ export function App(props: AppProps) {
   const blocked = () => props.store.state.prompt !== undefined
   const pager = () => props.store.state.pager
   const dashboard = () => props.store.state.dashboard
-  const switcher = () => props.store.state.switcher
+  const sessionPicker = () => props.store.state.sessionPicker
   const picker = () => props.store.state.picker
   const promptHistory = () => props.store.state.promptHistory
   // Defer the close so the key that closed an overlay (Esc/q/Enter) can't land in
   // the freshly-remounted composer (see deferClose).
   const closePager = () => deferClose(() => props.store.closePager())
   const closeDashboard = () => deferClose(() => props.store.closeDashboard())
-  const closeSwitcher = () => deferClose(() => props.store.closeSwitcher())
+  // close WITHOUT a pick — the boot path may create a fresh session here.
+  const closeSessionPicker = () =>
+    deferClose(() => {
+      props.store.closeSessionPicker()
+      props.onSessionPickerClosed?.()
+    })
   const closePicker = () => deferClose(() => props.store.closePicker())
   const closePromptHistory = () => deferClose(() => props.store.closePromptHistory())
   // Esc+Esc viewer trigger (Epic 5): only when this session HAS user prompts —
@@ -80,7 +97,8 @@ export function App(props: AppProps) {
   }
   const resume = (id: string) => {
     ;(props.onResume ?? NOOP_RESUME)(id)
-    closeSwitcher()
+    // a PICK closes without the no-pick callback (the resume owns the session)
+    deferClose(() => props.store.closeSessionPicker())
   }
 
   return (
@@ -133,8 +151,15 @@ export function App(props: AppProps) {
                         sessionId={props.sessionId ?? NO_SESSION}
                       />
                     </Match>
-                    <Match when={switcher()}>
-                      {sessions => <SessionSwitcher sessions={sessions()} onPick={resume} onClose={closeSwitcher} />}
+                    <Match when={sessionPicker()}>
+                      {sp => (
+                        <SessionPicker
+                          ops={props.sessionOps ?? NOOP_OPS}
+                          initialTab={sp().tab}
+                          onResume={resume}
+                          onClose={closeSessionPicker}
+                        />
+                      )}
                     </Match>
                     <Match when={picker()}>
                       {p => (

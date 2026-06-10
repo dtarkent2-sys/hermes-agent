@@ -14,7 +14,8 @@
 import { DETAILS_SECTIONS, DETAILS_USAGE, type DetailsMode, nextDetailsMode, parseDetailsMode } from './details.ts'
 import { formatBytes, memReport, performHeapdump } from './diagnostics.ts'
 import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from './replay.ts'
-import type { CompletionItem, PickerItem, PickerState, SessionItem } from './store.ts'
+import { mapSessionRows, parseSessionTabArg, resolveSessionArg, type SessionTabId } from './sessionPicker.ts'
+import type { CompletionItem, PickerItem, PickerState } from './store.ts'
 
 export interface ParsedSlash {
   name: string
@@ -48,10 +49,10 @@ export interface SlashContext {
   readonly quit: () => void
   /** Recent log lines for `/logs` (the ring buffer). */
   readonly logTail: () => string[]
-  /** Fetch the resumable sessions (`session.list`) for the switcher. */
-  readonly listSessions: () => Promise<SessionItem[]>
-  /** Open the session switcher with the given rows. */
-  readonly openSwitcher: (sessions: SessionItem[]) => void
+  /** Open the tabbed resume picker on the given tab (/sessions, bare /resume). */
+  readonly openSessionPicker: (tab: SessionTabId) => void
+  /** Resume a session directly by id (`/resume <id|name>` — no picker). */
+  readonly resumeSession: (sessionId: string) => void
   /** Open a generic picker (model picker, skills hub). */
   readonly openPicker: (picker: PickerState) => void
   /** Open the agents dashboard (/agents, /tasks). */
@@ -153,7 +154,8 @@ const CLIENT_HELP = [
   '/model [name] — switch model (picker if bare)',
   '/copy [n] — copy the last (or n-th) response',
   '/skills — browse skills',
-  '/sessions, /resume — switch/resume a session',
+  '/sessions [cron|gateways|all] — browse/resume sessions (tabbed picker)',
+  '/resume [id|name] — resume directly, or open the picker',
   '/clear, /new — clear the transcript (confirm)',
   '/compact [on|off|toggle] — compact transcript spacing',
   '/details [hidden|collapsed|expanded|cycle] — tool/reasoning detail',
@@ -167,11 +169,39 @@ const CLIENT_HELP = [
 
 type ClientHandler = (arg: string, ctx: SlashContext) => void | Promise<void>
 
-/** Fetch sessions and open the switcher (shared by /sessions, /resume, /switch, /session). */
-const openSwitcher: ClientHandler = async (_arg, ctx) => {
-  const sessions = await ctx.listSessions()
-  if (sessions.length) ctx.openSwitcher(sessions)
-  else ctx.pushSystem('No sessions to resume.')
+/** `/sessions [recent|cron|gateways|all]` — open the tabbed resume picker,
+ *  pre-selecting the named tab (shared by /sessions, /switch, /session). */
+const sessionsCmd: ClientHandler = (arg, ctx) => {
+  const tab = parseSessionTabArg(arg)
+  if (!tab) {
+    ctx.pushSystem('usage: /sessions [recent|cron|gateways|all]')
+    return
+  }
+  ctx.openSessionPicker(tab)
+}
+
+/** `/resume` — bare opens the picker; `/resume <id|name>` keeps the DIRECT
+ *  path: resolve the arg against `session.list` (exact id → unique id prefix
+ *  → exact/unique title) and hydrate without the overlay. */
+const resumeCmd: ClientHandler = async (arg, ctx) => {
+  const needle = arg.trim()
+  if (!needle) {
+    ctx.openSessionPicker('recent')
+    return
+  }
+  try {
+    // One bounded page over ALL sources (the gateway deny-lists `tool`) — the
+    // direct path targets a known session, not a browse.
+    const { rows } = mapSessionRows(await ctx.request('session.list', { limit: 200 }))
+    const hit = resolveSessionArg(rows, needle)
+    if (!hit) {
+      ctx.pushSystem(`/resume: no session matching “${needle}” — try /sessions`)
+      return
+    }
+    ctx.resumeSession(hit.id)
+  } catch (error) {
+    ctx.pushSystem(`/resume: ${error instanceof Error ? error.message : 'session.list failed'}`)
+  }
 }
 
 /**
@@ -590,11 +620,11 @@ const CLIENT: Record<string, ClientHandler> = {
   mem: memCmd,
   model: modelCmd,
   replay: replayCmd,
-  resume: openSwitcher,
-  session: openSwitcher,
-  sessions: openSwitcher,
+  resume: resumeCmd,
+  session: sessionsCmd,
+  sessions: sessionsCmd,
   skills: skillsCmd,
-  switch: openSwitcher,
+  switch: sessionsCmd,
   tasks: (_arg, ctx) => ctx.openDashboard(),
   tools: toolsCmd,
   help: async (_arg, ctx) => {

@@ -19,9 +19,8 @@ import {
   runPickerRefresh,
   type SlashContext
 } from '../logic/slash.ts'
-import type { PickerItem, SessionItem } from '../logic/store.ts'
-
-const FAKE_SESSIONS: SessionItem[] = [{ id: 's1', messageCount: 5, preview: 'hello there', title: 'First chat' }]
+import type { SessionTabId } from '../logic/sessionPicker.ts'
+import type { PickerItem } from '../logic/store.ts'
 
 // the picker-refresh/tabs/prefetch seams are module-level state — never leak them across tests
 afterEach(() => {
@@ -137,7 +136,8 @@ interface Probe {
   submitted: string[]
   confirmed: Array<{ message: string; onConfirm: () => void }>
   paged: Array<{ title: string; text: string }>
-  switched: SessionItem[][]
+  sessionPickers: SessionTabId[]
+  resumed: string[]
   pickers: Array<{ title: string; items: PickerItem[]; onPick: (value: string) => void }>
   quit: { value: boolean }
   cleared: { value: boolean }
@@ -157,7 +157,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const submitted: string[] = []
   const confirmed: Probe['confirmed'] = []
   const paged: Probe['paged'] = []
-  const switched: Probe['switched'] = []
+  const sessionPickers: SessionTabId[] = []
+  const resumed: string[] = []
   const pickers: Probe['pickers'] = []
   const quit = { value: false }
   const cleared = { value: false }
@@ -179,14 +180,14 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
       copied.push(n)
       return copyN.value(n)
     },
-    listSessions: () => Promise.resolve(FAKE_SESSIONS),
     logTail: () => ['gateway: spawned', 'bootstrap: session created'],
     modelItems: () => modelCache.value,
     setModelItems: items => (modelCache.value = items),
     openDashboard: () => (dashboard.value = true),
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: p => pickers.push(p),
-    openSwitcher: sessions => switched.push(sessions),
+    openSessionPicker: tab => sessionPickers.push(tab),
+    resumeSession: id => resumed.push(id),
     pushSystem: text => system.push(text),
     quit: () => (quit.value = true),
     request: (method, params) => {
@@ -210,8 +211,9 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     paged,
     pickers,
     quit,
+    resumed,
+    sessionPickers,
     submitted,
-    switched,
     system
   }
 }
@@ -240,14 +242,44 @@ describe('dispatchSlash — client commands', () => {
     expect(p.paged[0]?.text).toContain('session created')
   })
 
-  test('/sessions (and /resume) open the switcher with session.list rows', async () => {
+  test('/sessions (and bare /resume) open the resume picker on the Recent tab', async () => {
     const p = makeCtx(async () => ({}))
     await dispatchSlash('/sessions', p.ctx)
-    expect(p.switched).toHaveLength(1)
-    expect(p.switched[0]).toEqual(FAKE_SESSIONS)
+    expect(p.sessionPickers).toEqual(['recent'])
+    expect(p.calls).toHaveLength(0) // the overlay fetches its own rows
     const p2 = makeCtx(async () => ({}))
     await dispatchSlash('/resume', p2.ctx)
-    expect(p2.switched).toHaveLength(1)
+    expect(p2.sessionPickers).toEqual(['recent'])
+  })
+
+  test('/sessions cron|gateways pre-select that tab; garbage -> usage', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/sessions cron', p.ctx)
+    await dispatchSlash('/sessions gateways', p.ctx)
+    await dispatchSlash('/sessions all', p.ctx)
+    expect(p.sessionPickers).toEqual(['cron', 'gateways', 'all'])
+    await dispatchSlash('/sessions bogus', p.ctx)
+    expect(p.sessionPickers).toHaveLength(3)
+    expect(p.system.at(-1)).toContain('usage: /sessions')
+  })
+
+  test('/resume <id|name> keeps the DIRECT path: resolves against session.list and resumes', async () => {
+    const rows = {
+      sessions: [
+        { id: 'abc-123', message_count: 5, preview: 'hello', source: 'tui', started_at: 1, title: 'First chat' },
+        { id: 'def-456', message_count: 2, preview: 'yo', source: 'cli', started_at: 2, title: 'Goal v4' }
+      ],
+      truncated: false
+    }
+    const p = makeCtx(async method => (method === 'session.list' ? rows : {}))
+    await dispatchSlash('/resume abc-123', p.ctx) // exact id
+    await dispatchSlash('/resume def', p.ctx) // unique id prefix
+    await dispatchSlash('/resume goal v4', p.ctx) // exact title (ci)
+    expect(p.resumed).toEqual(['abc-123', 'def-456', 'def-456'])
+    expect(p.sessionPickers).toHaveLength(0) // never opened the overlay
+    await dispatchSlash('/resume nope', p.ctx)
+    expect(p.resumed).toHaveLength(3)
+    expect(p.system.at(-1)).toContain('no session matching')
   })
 
   test('/model (bare) opens a GROUPED picker of authenticated providers’ models; pick switches', async () => {

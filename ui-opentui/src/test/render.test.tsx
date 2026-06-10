@@ -186,27 +186,37 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).not.toContain('Type your message') // composer hidden while the pager is open
   })
 
-  test('the session switcher renders session rows and replaces the composer', async () => {
+  test('the resume picker renders session rows and replaces the composer', async () => {
     const store = createSessionStore()
     store.apply({ type: 'gateway.ready' })
-    store.openSwitcher([
-      { id: 's1', title: 'First chat', preview: 'hi', messageCount: 5 },
-      { id: 's2', title: 'Second chat', preview: 'yo', messageCount: 12 }
-    ])
+    store.openSessionPicker()
 
+    const sessionOps = {
+      list: () =>
+        Promise.resolve({
+          sessions: [
+            { id: 's1', message_count: 5, preview: 'hi', source: 'tui', started_at: 1, title: 'First chat' },
+            { id: 's2', message_count: 12, preview: 'yo', source: 'cli', started_at: 2, title: 'Second chat' }
+          ],
+          truncated: false
+        }),
+      peek: () => Promise.resolve({}),
+      rename: () => Promise.resolve()
+    }
     const frame = await captureFrame(
       () => (
         <ThemeProvider theme={() => store.state.theme}>
-          <App store={store} />
+          <App store={store} sessionOps={sessionOps} />
         </ThemeProvider>
       ),
-      { until: 'Resume a session', width: 72, height: 18 }
+      { until: 'First chat', width: 72, height: 24 }
     )
 
-    expect(frame).toContain('Resume a session') // switcher header
+    expect(frame).toContain('Resume session') // picker header
     expect(frame).toContain('First chat') // session row
     expect(frame).toContain('Second chat')
-    expect(frame).not.toContain('Type your message') // composer hidden while switcher open
+    expect(frame).toContain('[ Recent ]') // default tab chip active
+    expect(frame).not.toContain('Type your message') // composer hidden while the picker is open
   })
 
   test('the composer shows a live slash-completions dropdown', async () => {

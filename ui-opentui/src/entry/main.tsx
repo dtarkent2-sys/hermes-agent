@@ -35,7 +35,7 @@ import { nthAssistantResponse } from '../logic/copy.ts'
 import { envFlag } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
 import { createPasteStore } from '../logic/pastes.ts'
-import { mapResumeHistory, mapSessionList } from '../logic/resume.ts'
+import { mapResumeHistory } from '../logic/resume.ts'
 import {
   dispatchSlash,
   mapCompletions,
@@ -47,6 +47,7 @@ import {
 } from '../logic/slash.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
+import type { SessionPickerOps } from '../view/overlays/sessionPicker.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { makeFakeGatewayLayer, type FakeGatewayController } from './fakeGateway.ts'
 
@@ -59,7 +60,9 @@ export interface TuiInput {
   readonly cols: number
   /** Optional initial prompt submitted once the session is ready — the Phase-1 stand-in for the composer. */
   readonly initialPrompt?: string
-  /** Resume a session instead of creating one: a session id, or 'recent'/'last' (→ session.most_recent). */
+  /** Resume a session instead of creating one: a session id, 'recent'/'last'
+   *  (→ session.most_recent), or 'picker' (bare `--resume` — open the resume
+   *  picker BEFORE any session.create; create stays lazy). */
   readonly resumeId?: string
 }
 
@@ -131,10 +134,66 @@ const resumeInto = (gateway: GatewayServiceShape, store: SessionStore, sid: stri
   })
 
 /**
+ * Post-session setup, shared by every way a session comes to exist (create,
+ * boot resume, boot-picker pick): the tools/skills/MCP catalog for the home
+ * panel (item 9 — best-effort), the optional initial prompt, and the `/model`
+ * catalog prefetch (Epic 7 instant open: `model.options` is the slow RPC —
+ * network pricing fetch + Nous tier check — so pay it ONCE in an already-
+ * forked fiber; the promise is STASHED in the slash seam so an early `/model`
+ * awaits THIS request instead of doubling it).
+ */
+const postSessionSetup = (gateway: GatewayServiceShape, store: SessionStore, sid: string, initialPrompt?: string) =>
+  Effect.gen(function* () {
+    const catalog = yield* gateway
+      .request<unknown>('startup.catalog', { session_id: sid })
+      .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+    if (catalog) store.setCatalog(catalog)
+
+    const prompt = initialPrompt?.trim()
+    if (prompt) {
+      store.pushUser(prompt)
+      yield* gateway.request('prompt.submit', { session_id: sid, text: prompt })
+    }
+
+    const prefetch = Effect.runPromise(
+      gateway
+        .request<unknown>('model.options', { session_id: sid })
+        .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+    ).then(modelOpts => {
+      const modelItems = mapModelOptions(modelOpts)
+      if (modelItems.length) store.setModelItems(modelItems)
+    })
+    registerModelPrefetch(prefetch)
+    yield* Effect.promise(() => prefetch)
+  })
+
+/** Create a FRESH session + run the post-session setup (the default boot path;
+ *  also the boot-picker's Esc fallback — closing the picker without a pick
+ *  must still leave a usable session behind). */
+const createFreshSession = (gateway: GatewayServiceShape, store: SessionStore, input: TuiInput) =>
+  Effect.gen(function* () {
+    const created = yield* gateway.request<{ session_id?: string; info?: Record<string, unknown> }>('session.create', {
+      cols: input.cols
+    })
+    const sid = created?.session_id ?? gateway.sessionId()
+    if (!sid) {
+      getLog().warn('bootstrap', 'session.create returned no session_id')
+      return
+    }
+    if (created?.info) store.applyInfo(created.info)
+    writeActiveSession(sid) // record the new session for the launcher's exit epilogue (#5)
+    store.setSessionId(sid)
+    getLog().info('bootstrap', 'session created', { sid })
+    yield* postSessionSetup(gateway, store, sid, input.initialPrompt)
+  })
+
+/**
  * Live session bootstrap: wait for the unsolicited `gateway.ready` handshake,
  * then either RESUME a session (hydrate its transcript — incl. tool rows — via
- * the snapshot, buffering live events across the RPC) or CREATE a fresh one, and
- * (if given) submit the initial prompt. Forked into the entry scope so it runs
+ * the snapshot, buffering live events across the RPC), open the resume PICKER
+ * (`resumeId === 'picker'` — bare `--resume`: no session is created until the
+ * user picks or closes; create is lazy), or CREATE a fresh one, and (if given)
+ * submit the initial prompt. Forked into the entry scope so it runs
  * concurrently with the render + the quit-await. Any failure is logged and
  * swallowed — a bootstrap hiccup must never tear down the rendered UI.
  */
@@ -151,9 +210,16 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
       return
     }
 
-    let sid: string | undefined
+    if (input.resumeId === 'picker') {
+      // Boot picker (design doc §A): opens BEFORE any session.create. The pick
+      // resumes via onResume (which then runs postSessionSetup); a close
+      // without a pick falls back to createFreshSession (onSessionPickerClosed).
+      store.openSessionPicker('recent')
+      return
+    }
+
     if (input.resumeId) {
-      sid = input.resumeId
+      let sid: string | undefined = input.resumeId
       if (sid === 'recent' || sid === 'last') {
         const recent = yield* gateway.request<{ session_id?: string }>('session.most_recent', {})
         sid = recent?.session_id
@@ -163,53 +229,11 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
         return
       }
       yield* resumeInto(gateway, store, sid, input.cols)
-    } else {
-      const created = yield* gateway.request<{ session_id?: string; info?: Record<string, unknown> }>(
-        'session.create',
-        { cols: input.cols }
-      )
-      sid = created?.session_id ?? gateway.sessionId()
-      if (!sid) {
-        log.warn('bootstrap', 'session.create returned no session_id')
-        return
-      }
-      if (created?.info) store.applyInfo(created.info)
-      writeActiveSession(sid) // record the new session for the launcher's exit epilogue (#5)
-      store.setSessionId(sid)
-      log.info('bootstrap', 'session created', { sid })
+      yield* postSessionSetup(gateway, store, sid, input.initialPrompt)
+      return
     }
 
-    // Tools/skills/MCP catalog for the home-screen panel (item 9) — best-effort,
-    // never blocks startup if the RPC is missing/old.
-    const catalog = yield* gateway
-      .request<unknown>('startup.catalog', { session_id: sid })
-      .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-    if (catalog) store.setCatalog(catalog)
-
-    const prompt = input.initialPrompt?.trim()
-    if (prompt) {
-      store.pushUser(prompt)
-      yield* gateway.request('prompt.submit', { session_id: sid, text: prompt })
-    }
-
-    // Prefetch the /model catalog (Epic 7 instant open): `model.options` is the
-    // slow RPC (it does network calls — pricing fetch + Nous tier check), so pay
-    // that cost ONCE here in this already-forked bootstrap fiber; `/model` then
-    // paints from memory on the same frame. Best-effort: if this hasn't landed
-    // (or the RPC is missing/old), /model falls back to fetching on first open.
-    // The promise is STASHED in the slash seam so a `/model` opened while the
-    // prefetch is still in flight awaits THIS request (bounded) instead of
-    // issuing a second concurrent model.options RPC (prefetch dedupe).
-    const prefetch = Effect.runPromise(
-      gateway
-        .request<unknown>('model.options', { session_id: sid })
-        .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-    ).then(modelOpts => {
-      const modelItems = mapModelOptions(modelOpts)
-      if (modelItems.length) store.setModelItems(modelItems)
-    })
-    registerModelPrefetch(prefetch)
-    yield* Effect.promise(() => prefetch)
+    yield* createFreshSession(gateway, store, input)
   }).pipe(Effect.catchCause(cause => Effect.sync(() => getLog().warn('bootstrap', 'failed', { cause: String(cause) }))))
 
 /** The entry Effect. Mirrors opencode `app.tsx:177` `run = Effect.fn("Tui.run")`. */
@@ -384,6 +408,45 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
+      // Resume a chosen session (resume picker pick or `/resume <id>` direct
+      // path) — the same hydrate path as launch. When the picker was the BOOT
+      // surface (bare `--resume`), no create ever ran, so the post-session
+      // setup (catalog, /model prefetch) runs here exactly once.
+      const onResume = (resumeSid: string) => {
+        Effect.runFork(
+          Effect.gen(function* () {
+            yield* resumeInto(gateway, store, resumeSid, input.cols)
+            if (!store.state.catalog) yield* postSessionSetup(gateway, store, resumeSid)
+          }).pipe(
+            Effect.catchCause(cause => Effect.sync(() => getLog().warn('resume', 'failed', { cause: String(cause) })))
+          )
+        )
+      }
+
+      // The resume picker's gateway calls (view/overlays/sessionPicker.tsx).
+      // `rename` goes through `session.title` — the existing title RPC (it
+      // reaches only LIVE gateway sessions; the picker surfaces rejections).
+      const sessionOps: SessionPickerOps = {
+        list: params => Effect.runPromise(gateway.request('session.list', params)),
+        peek: sessionId => Effect.runPromise(gateway.request('session.peek', { session_id: sessionId })),
+        rename: (sessionId, title) =>
+          Effect.runPromise(gateway.request('session.title', { session_id: sessionId, title })).then(() => undefined)
+      }
+
+      // Boot-picker Esc fallback: the picker closed without a pick and no
+      // session exists yet (bare `--resume` launch) — create a fresh one so
+      // the composer has somewhere to send prompts.
+      const onSessionPickerClosed = () => {
+        if (gateway.sessionId()) return
+        Effect.runFork(
+          createFreshSession(gateway, store, input).pipe(
+            Effect.catchCause(cause =>
+              Effect.sync(() => getLog().warn('bootstrap', 'post-picker create failed', { cause: String(cause) }))
+            )
+          )
+        )
+      }
+
       // Slash dispatch context (Solid logic; the boundary just hands it a
       // Promise-returning `request` + the host capabilities it needs).
       const slashCtx: SlashContext = {
@@ -407,7 +470,6 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           flashHint(n > 1 ? `Copied response #${n} to clipboard` : 'Copied response to clipboard')
           return true
         },
-        listSessions: () => Effect.runPromise(gateway.request('session.list', {})).then(mapSessionList),
         modelItems: () => store.state.modelItems,
         setModelItems: items => store.setModelItems(items),
         logTail: () =>
@@ -417,7 +479,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         openDashboard: () => store.openDashboard(),
         openPager: (title, text) => store.openPager(title, text),
         openPicker: picker => store.openPicker(picker),
-        openSwitcher: sessions => store.openSwitcher(sessions),
+        openSessionPicker: tab => store.openSessionPicker(tab),
+        resumeSession: onResume,
         pushSystem: text => store.pushSystem(text),
         quit: () => {
           if (!renderer.isDestroyed) renderer.destroy()
@@ -425,15 +488,6 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         request: (method, params) => Effect.runPromise(gateway.request(method, params)),
         sessionId: () => gateway.sessionId(),
         submit: submitPrompt
-      }
-
-      // Resume a chosen session (session switcher pick) — same hydrate path as launch.
-      const onResume = (resumeSid: string) => {
-        Effect.runFork(
-          resumeInto(gateway, store, resumeSid, input.cols).pipe(
-            Effect.catchCause(cause => Effect.sync(() => getLog().warn('resume', 'failed', { cause: String(cause) })))
-          )
-        )
       }
 
       // The composer's submit: route `/command` through the slash ladder, else a prompt.
@@ -489,6 +543,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                   onType={onType}
                   onRespond={respond}
                   onResume={onResume}
+                  sessionOps={sessionOps}
+                  onSessionPickerClosed={onSessionPickerClosed}
                   sessionId={() => gateway.sessionId()}
                   history={history}
                   onImagePaste={onImagePaste}

@@ -23,6 +23,7 @@ import {
 } from '../boundary/schema/SessionInfo.ts'
 import type { DetailsMode } from './details.ts'
 import { diffStats, type DiffStats } from './diff.ts'
+import type { SessionTabId } from './sessionPicker.ts'
 import { envOutputUnlimited } from './env.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
 import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
@@ -98,12 +99,20 @@ export interface PagerState {
   text: string
 }
 
-/** One row in the session switcher (from `session.list`). */
+/** One row in the legacy flat session list (from `session.list`). Kept for
+ *  `mapSessionList` (resume.ts); the resume PICKER uses the richer
+ *  `SessionRow` (logic/sessionPicker.ts). */
 export interface SessionItem {
   id: string
   title: string
   preview: string
   messageCount: number
+}
+
+/** The open resume picker overlay (/sessions, /resume, boot `--resume`):
+ *  just the pre-selected tab — the overlay fetches its own rows. */
+export interface SessionPickerOverlay {
+  tab: SessionTabId
 }
 
 /** A row in the generic picker overlay (model picker, skills hub, …). */
@@ -216,8 +225,8 @@ export interface StoreState {
   prompt: ActivePrompt | undefined
   /** The open pager overlay (replaces the transcript while set); undefined when none. */
   pager: PagerState | undefined
-  /** The open session switcher (replaces the composer while set); undefined when none. */
-  switcher: SessionItem[] | undefined
+  /** The open resume picker (replaces the composer while set); undefined when none. */
+  sessionPicker: SessionPickerOverlay | undefined
   /** The open generic picker (model/skills/…); undefined when none. */
   picker: PickerState | undefined
   /** Whether the Esc+Esc session prompt-history viewer is open (Epic 5). */
@@ -400,7 +409,7 @@ export function createSessionStore() {
     theme: DEFAULT_THEME,
     prompt: undefined,
     pager: undefined,
-    switcher: undefined,
+    sessionPicker: undefined,
     picker: undefined,
     promptHistory: false,
     completions: undefined,
@@ -566,14 +575,14 @@ export function createSessionStore() {
     setState('pager', undefined)
   }
 
-  /** Open the session switcher with the given session rows (/sessions, /resume). */
-  function openSwitcher(sessions: SessionItem[]) {
-    setState('switcher', sessions)
+  /** Open the resume picker on the given tab (/sessions, /resume, boot picker). */
+  function openSessionPicker(tab: SessionTabId = 'recent') {
+    setState('sessionPicker', { tab })
   }
 
-  /** Close the session switcher. */
-  function closeSwitcher() {
-    setState('switcher', undefined)
+  /** Close the resume picker. */
+  function closeSessionPicker() {
+    setState('sessionPicker', undefined)
   }
 
   /** Open the generic picker (model picker, skills hub, …). */
@@ -997,8 +1006,8 @@ export function createSessionStore() {
     setConfirm,
     openPager,
     closePager,
-    openSwitcher,
-    closeSwitcher,
+    openSessionPicker,
+    closeSessionPicker,
     openPicker,
     closePicker,
     openPromptHistory,
