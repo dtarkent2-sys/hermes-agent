@@ -5784,34 +5784,14 @@ def _update_via_zip(args):
     update_managed_uv()
 
     uv_bin = ensure_uv()
-
-    pip_cmd = [sys.executable, "-m", "pip"]
     if not uv_bin:
-        uv_bin = _ensure_uv_for_termux(pip_cmd)
+        uv_bin = _ensure_uv_for_termux(get_pip_cmd())
+        
     if uv_bin:
-        uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-        if _is_termux_env(uv_env):
-            uv_env.pop("PYTHONPATH", None)
-            uv_env.pop("PYTHONHOME", None)
-        _install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+        _install_python_dependencies_with_optional_fallback()
     else:
-        # Use sys.executable to explicitly call the venv's pip module,
-        # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
-        # Hermes guarantees a managed uv binary via ensure_uv().
-        from hermes_cli.managed_uv import ensure_uv
-        uv_bin = ensure_uv()
-        if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-            if _is_termux_env(uv_env):
-                uv_env.pop("PYTHONPATH", None)
-                uv_env.pop("PYTHONHOME", None)
-            _install_python_dependencies_with_optional_fallback(
-                [uv_bin, "pip"], env=uv_env, group="termux-all" if _is_termux_env(uv_env) else "all"
-            )
-        else:
-            _install_python_dependencies_with_optional_fallback(
-                [sys.executable, "-m", "pip"], group="termux-all" if _is_termux_env() else "all"
-            )
+        # Degenerate fallback: managed uv failed to install.
+        _install_python_dependencies_with_optional_fallback(group="termux-all" if _is_termux_env() else "all")
 
     _update_node_dependencies()
     _build_web_ui(PROJECT_ROOT / "web")
@@ -6502,19 +6482,12 @@ def _recover_from_interrupted_install() -> None:
             # it via the official installer if a killed install removed it.
             uv_bin = ensure_uv()
             if uv_bin:
-                uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-                if _is_termux_env(uv_env):
-                    uv_env.pop("PYTHONPATH", None)
-                    uv_env.pop("PYTHONHOME", None)
                 _install_python_dependencies_with_optional_fallback(
-                    [uv_bin, "pip"],
-                    env=uv_env,
-                    group="termux-all" if _is_termux_env(uv_env) else "all",
+                    group="termux-all" if _is_termux_env() else "all",
                 )
             else:
                 # Degenerate fallback: managed uv failed to install.
                 _install_python_dependencies_with_optional_fallback(
-                    [sys.executable, "-m", "pip"],
                     group="termux-all" if _is_termux_env() else "all",
                 )
 
@@ -7026,7 +6999,6 @@ def _refresh_active_lazy_features() -> None:
 
 
 def _install_python_dependencies_with_optional_fallback(
-    install_cmd_prefix: list[str],
     *,
     env: dict[str, str] | None = None,
     group: str = "all",
@@ -7040,7 +7012,12 @@ def _install_python_dependencies_with_optional_fallback(
     in the venv Scripts dir before each install attempt so uv can write fresh
     copies (Windows blocks REPLACE on a running .exe but allows RENAME). See
     ``_quarantine_running_hermes_exe`` for the rationale.
+    
+    Uses the authoritative `get_pip_cmd()` for dependency installation.
     """
+    from hermes_cli.managed_uv import get_pip_cmd
+    
+    install_cmd_prefix = get_pip_cmd()
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     def _install(args: list[str]) -> None:
@@ -8487,54 +8464,36 @@ def _cmd_update_impl(args, gateway_mode: bool):
         update_managed_uv()
 
         uv_bin = ensure_uv()
-
-        pip_cmd = [sys.executable, "-m", "pip"]
-        if not uv_bin:
-            uv_bin = _ensure_uv_for_termux(pip_cmd)
         install_group = "all"
 
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-            if _is_termux_env(uv_env):
-                uv_env.pop("PYTHONPATH", None)
-                uv_env.pop("PYTHONHOME", None)
+            if _is_termux_env():
                 install_group = "termux-all"
                 print("  → Termux detected: using uv + curated termux-all optional profile...")
-            if _is_termux_env(uv_env) and _is_android_python():
+            if _is_termux_env() and _is_android_python():
                 print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
-                _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
-            _install_python_dependencies_with_optional_fallback(
-                [uv_bin, "pip"], env=uv_env, group=install_group
-            )
+                _install_psutil_android_compat(get_pip_cmd())
+            _install_python_dependencies_with_optional_fallback(group=install_group)
         else:
-            # Use sys.executable to explicitly call the venv's pip module,
-            # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
-            # Hermes guarantees a managed uv binary via ensure_uv().
-            from hermes_cli.managed_uv import ensure_uv
+            # Degenerate fallback: managed uv failed to install.
             uv_bin = ensure_uv()
             if uv_bin:
-                uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-                if _is_termux_env(uv_env):
-                    install_group = "termux-all"
-                    print("  → Termux detected: using curated termux-all optional profile...")
-                    uv_env.pop("PYTHONPATH", None)
-                    uv_env.pop("PYTHONHOME", None)
-                if _is_termux_env() and _is_android_python():
-                    print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
-                    _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
-                _install_python_dependencies_with_optional_fallback(
-                    [uv_bin, "pip"], env=uv_env, group=install_group
-                )
-            else:
-                # Degenerate fallback: managed uv failed to install.
-                pip_cmd = [sys.executable, "-m", "pip"]
                 if _is_termux_env():
                     install_group = "termux-all"
                     print("  → Termux detected: using curated termux-all optional profile...")
                 if _is_termux_env() and _is_android_python():
                     print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
-                    _install_psutil_android_compat(pip_cmd)
-                _install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
+                    _install_psutil_android_compat(get_pip_cmd())
+                _install_python_dependencies_with_optional_fallback(group=install_group)
+            else:
+                # Ultimate degenerate fallback: no uv at all.
+                if _is_termux_env():
+                    install_group = "termux-all"
+                    print("  → Termux detected: using curated termux-all optional profile...")
+                if _is_termux_env() and _is_android_python():
+                    print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
+                    _install_psutil_android_compat(get_pip_cmd())
+                _install_python_dependencies_with_optional_fallback(group=install_group)
 
         # Core Python deps installed AND verified (the fallback helper runs
         # _verify_core_dependencies_installed). Clear the interrupted-install

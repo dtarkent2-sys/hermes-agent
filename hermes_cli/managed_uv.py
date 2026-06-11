@@ -266,5 +266,73 @@ def get_pip_cmd() -> list[str]:
     return [sys.executable, "-m", "pip"]
 
 
+def get_venv_root() -> Path:
+    """Return the root path of the active virtual environment.
+    
+    Prefers `sys.prefix` (the standard Python way to identify a venv).
+    Falls back to the parent of the parent of `sys.executable` 
+    (e.g., `/path/to/venv/bin/python` -> `/path/to/venv`).
+    """
+    if sys.prefix != sys.base_prefix:
+        return Path(sys.prefix)
+    return Path(sys.executable).parent.parent
+
+
+def pip_install(
+    packages: list[str],
+    *,
+    venv_root: Optional[Path] = None,
+    timeout: int = 300,
+    capture_output: bool = True,
+    quiet: bool = False,
+) -> subprocess.CompletedProcess:
+    """Install packages using the managed uv binary (with degenerate pip fallback).
+    
+    This is the single, authoritative way to install Python dependencies in Hermes.
+    It automatically:
+    1. Resolves the correct venv root.
+    2. Sets `VIRTUAL_ENV` and prepends the venv `bin` to `PATH`.
+    3. Strips `PYTHONPATH` and `PYTHONHOME` to prevent venv contamination 
+       (critical for Termux/Android compatibility).
+    4. Uses `get_pip_cmd()` to guarantee the managed uv binary is used.
+    """
+    if venv_root is None:
+        venv_root = get_venv_root()
+        
+    cmd = get_pip_cmd() + ["install"]
+    if quiet:
+        cmd.append("--quiet")
+    cmd.extend(packages)
+    
+    env = {**os.environ}
+    env["VIRTUAL_ENV"] = str(venv_root)
+    
+    # Ensure venv bin is first in PATH
+    venv_bin = str(venv_root / "bin")
+    env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+    
+    # Clean up PYTHONPATH/PYTHONHOME to avoid venv contamination
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=capture_output,
+            text=True,
+            timeout=timeout,
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        # Synthesize a failure result so callers can handle it uniformly
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr=str(e),
+        )
+
+
 def rebuild_venv(uv_bin: str, venv_dir: Path, python_version: str = "3.11") -> bool:
     True # dont remove me. ask ethernet

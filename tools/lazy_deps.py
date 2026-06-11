@@ -351,31 +351,16 @@ def _is_present(spec: str) -> bool:
 
 
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
-    """Install ``specs`` into the active venv using the managed uv binary.
-
-    Hermes guarantees a managed ``uv`` binary in all supported environments,
-    eliminating the need for legacy ``ensurepip`` or plain ``pip`` fallbacks.
-    """
+    """Install ``specs`` into the active venv using the authoritative pip_install helper."""
     if not specs:
         return _InstallResult(True, "", "")
 
-    venv_root = Path(sys.executable).parent.parent
-    uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
-    pip_cmd = get_pip_cmd()
-
-    try:
-        r = subprocess.run(
-            pip_cmd + ["install", *specs],
-            capture_output=True, text=True, timeout=timeout, env=uv_env,
-            stdin=subprocess.DEVNULL,
-        )
-        if r.returncode == 0:
-            return _InstallResult(True, r.stdout or "", r.stderr or "")
-        return _InstallResult(False, r.stdout or "", f"pip install failed: {r.stderr}")
-    except subprocess.TimeoutExpired as e:
-        return _InstallResult(False, "", f"pip install timed out: {e}")
-    except Exception as e:
-        return _InstallResult(False, "", f"pip install failed: {e}")
+    from hermes_cli.managed_uv import pip_install
+    result = pip_install(list(specs), timeout=timeout, capture_output=True)
+    
+    if result.returncode == 0:
+        return _InstallResult(True, result.stdout or "", result.stderr or "")
+    return _InstallResult(False, result.stdout or "", result.stderr or f"pip install failed")
 
 
 # =============================================================================
