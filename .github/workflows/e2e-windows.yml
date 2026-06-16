@@ -1,4 +1,4 @@
-name: E2E: Windows Desktop
+name: E2E - Windows Desktop
 
 on:
   push:
@@ -115,9 +115,9 @@ jobs:
       # Isolated install directory so the real install flow doesn't touch the
       # runner's user profile. Kept under the workspace for easy cleanup.
       HERMES_HOME: ${{ github.workspace }}\.e2e-hermes-home
+      HERMES_E2E_INSTALL_ROOT: ${{ github.workspace }}\.e2e-hermes-home\hermes-agent
 
     steps:
-
       - name: Checkout src code to hermes home
         uses: actions/checkout@v4
         with:
@@ -126,7 +126,7 @@ jobs:
       - name: Download installer artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: hermes-installer-${{ runner.os }}-${{ hashFiles('${{ github.workspace }}.e2e-hermes-home/package-lock.json', '${{ github.workspace }}.e2e-hermes-home/apps/bootstrap-installer/**', '!${{ github.workspace }}.e2e-hermes-home/apps/bootstrap-installer/src-tauri/target/**') }}
+          name: hermes-installer-${{ runner.os }}-${{ hashFiles('${{ HERMES_E2E_INSTALL_ROOT }}/package-lock.json', '${{ HERMES_E2E_INSTALL_ROOT }}/apps/bootstrap-installer/**', '!${{ HERMES_E2E_INSTALL_ROOT }}/apps/bootstrap-installer/src-tauri/target/**') }}
 
       - name: Restore cached test tools
         id: test-tools-cache
