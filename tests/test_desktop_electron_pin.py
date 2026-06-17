@@ -96,40 +96,57 @@ def test_lockfile_resolves_the_pinned_electron():
     )
 
 
-def test_electron_dist_matches_lockfile_install_location():
-    """build.electronDist must point at where the lockfile installs Electron.
+DESKTOP_DIR = REPO_ROOT / "apps" / "desktop"
+ELECTRON_BUILDER_WRAPPER = DESKTOP_DIR / "scripts" / "run-electron-builder.cjs"
 
-    electron-builder copies the unpacked Electron from ``build.electronDist``
-    (resolved relative to ``apps/desktop``). npm workspace hoisting is not
-    deterministic across machines/npm versions: it may nest Electron under
-    ``apps/desktop/node_modules/electron`` or hoist it to the repo root. If
-    electronDist points at one location while the lockfile installs at the
-    other, packaging fails with ``The specified electronDist does not exist`` —
-    the "Building desktop app" failure reported after the June lockfile
-    regeneration floated Electron and reshuffled the hoist. Lock the two
-    together so a hoist change (root <-> nested) can't silently break the path
-    again.
+
+def test_no_static_electron_dist_that_can_drift():
+    """build.electronDist must NOT be a hardcoded path in package.json.
+
+    electron-builder reads the unpacked Electron from ``build.electronDist``, but
+    npm workspace hoisting is not deterministic across machines/npm versions: it
+    may nest Electron under ``apps/desktop/node_modules/electron`` or hoist it to
+    the repo root. A static relative path matches only one layout, so a clean
+    install intermittently fails with ``The specified electronDist does not
+    exist`` (the June desktop-build outage: #47917, #48019, #48021, #48084).
+
+    The fix resolves electronDist at runtime (``scripts/run-electron-builder.cjs``
+    via ``require.resolve``), so there must be no static value to drift. If a
+    future change re-pins a hardcoded path here, this fails and points back at
+    the dynamic resolver.
     """
-    if not ROOT_LOCK.is_file():
-        pytest.skip("root package-lock.json not present")
-    electron_dist = _desktop_pkg().get("build", {}).get("electronDist")
-    assert electron_dist, "build.electronDist is missing"
+    assert "electronDist" not in _desktop_pkg().get("build", {}), (
+        "build.electronDist is hardcoded again. npm hoisting is non-deterministic, "
+        "so a static path silently breaks packaging when the layout changes. Let "
+        "scripts/run-electron-builder.cjs resolve it dynamically instead."
+    )
 
-    lock = json.loads(ROOT_LOCK.read_text(encoding="utf-8"))
-    electron_paths = [
-        path
-        for path in lock.get("packages", {})
-        if path.endswith("node_modules/electron")
-    ]
-    assert electron_paths, "no electron entry found in package-lock.json"
 
-    desktop_dir = REPO_ROOT / "apps" / "desktop"
-    # electronDist is resolved relative to the apps/desktop project dir.
-    configured = (desktop_dir / electron_dist).resolve()
-    # Where the lockfile actually places Electron's unpacked dist.
-    installed = {(REPO_ROOT / p / "dist").resolve() for p in electron_paths}
-    assert configured in installed, (
-        f"build.electronDist={electron_dist!r} resolves to {configured}, but the "
-        f"lockfile installs Electron at {sorted(str(p) for p in installed)}. "
-        "electron-builder will fail with 'electronDist does not exist'."
+def test_builder_script_routes_through_dynamic_resolver():
+    """`npm run builder` must invoke the dynamic-resolver wrapper, not bare
+    electron-builder — otherwise electronDist is never injected and the hoist
+    bug returns."""
+    builder = _desktop_pkg().get("scripts", {}).get("builder", "")
+    assert "run-electron-builder.cjs" in builder, (
+        f"the 'builder' script must run scripts/run-electron-builder.cjs, got "
+        f"{builder!r}"
+    )
+    assert ELECTRON_BUILDER_WRAPPER.is_file(), (
+        f"missing dynamic-resolver wrapper at {ELECTRON_BUILDER_WRAPPER}"
+    )
+
+
+def test_resolver_uses_node_module_resolution():
+    """The wrapper must locate Electron via Node module resolution so the path
+    follows npm's actual install layout (nested or hoisted) instead of a
+    hardcoded guess."""
+    src = ELECTRON_BUILDER_WRAPPER.read_text(encoding="utf-8")
+    assert 'require.resolve("electron/package.json")' in src, (
+        "run-electron-builder.cjs must resolve electron via "
+        "require.resolve('electron/package.json') to stay hoist-proof."
+    )
+    # And it must hand the resolved dist to electron-builder as an override.
+    assert "-c.electronDist=" in src, (
+        "run-electron-builder.cjs must pass the resolved dist to electron-builder "
+        "via -c.electronDist."
     )

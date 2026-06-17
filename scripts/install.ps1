@@ -2161,6 +2161,12 @@ function Clear-ElectronBuildCache {
     return $removed
 }
 
+# Public Electron mirror used as a last-resort fallback when GitHub's release
+# host is blocked/throttled (#47266). npmmirror.com (Alibaba) is the de-facto
+# Electron community mirror; only reached AFTER the canonical download fails and
+# never when the user has pinned their own ELECTRON_MIRROR.
+$script:DesktopElectronFallbackMirror = "https://npmmirror.com/mirrors/electron/"
+
 # Return the Electron package directory the desktop workspace installs. npm may
 # nest workspace-only dev dependencies under apps\desktop\node_modules instead
 # of hoisting them to the repo root; which layout you get depends on the npm
@@ -2188,14 +2194,14 @@ function Test-ElectronDist {
 
 # (Re)populate the desktop Electron dist via electron's own downloader.
 #
-# Since #38673 the desktop build pins build.electronDist, so electron-builder
-# reads the Electron binary straight from there and never downloads it during
-# `npm run pack`. That dist tree is produced by the electron package's
-# postinstall (install.js) during `npm ci`. When that download is
-# blocked/throttled (GitHub's release host is unreachable in some regions -
-# #47266), dist is missing and re-running pack only re-throws "The specified
-# electronDist does not exist". The mirror fallback therefore has to drive THIS
-# downloader, not another pack.
+# Since #38673 the desktop build reuses the electron package's already-unpacked
+# dist (resolved dynamically by scripts\run-electron-builder.cjs) to dodge
+# electron-builder 26.8.x's missing-binary re-unpack bug. That dist tree is
+# produced by the electron package's postinstall (install.js) during `npm ci`.
+# When that download is blocked/throttled (GitHub's release host is unreachable
+# in some regions - #47266), dist is missing. Pre-fetching it here gives the
+# build a dist to reuse; if it can't, the build lets electron-builder fetch
+# Electron itself, so this is best-effort.
 #
 # No-op (returns $true) when the dist binary is already present. Otherwise drops a
 # partial dist + version marker (electron's install.js short-circuits when
@@ -2329,10 +2335,34 @@ function Install-Desktop {
         }
         $ErrorActionPreference = $prevEAP
         if ($code -ne 0) {
-            Show-NpmCertHint ($npmOut -join "`n") | Out-Null
-            throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+            # npm runs postinstall scripts LAST, after every package is staged on
+            # disk. The most common failure here is electron's install.js doing
+            # `process.exit(1)` on a blocked/throttled binary download (#47266,
+            # #47917, #48021): the whole tree is present and only electron's dist\
+            # is missing. If the electron package staged, repopulate its dist via
+            # electron's own downloader (canonical, then the public mirror) and
+            # carry on to the build; even if that can't fetch it, `npm run pack`
+            # resolves electronDist dynamically and lets electron-builder fetch
+            # Electron itself, so the build-stage mirror fallback gets a final
+            # shot. Bailing here is what made that fallback unreachable on a
+            # blocked network. Only hard-fail when electron never staged at all.
+            $electronPkg = Join-Path (Get-ElectronDir -InstallDir $InstallDir) 'package.json'
+            if (Test-Path -LiteralPath $electronPkg) {
+                Write-Warn "Desktop dependency install failed on the Electron binary download; self-healing..."
+                if (-not (Test-ElectronDist -InstallDir $InstallDir)) {
+                    if (-not (Restore-ElectronDist -InstallDir $InstallDir)) {
+                        if (-not $env:ELECTRON_MIRROR) {
+                            Restore-ElectronDist -InstallDir $InstallDir -Mirror $script:DesktopElectronFallbackMirror | Out-Null
+                        }
+                    }
+                }
+            } else {
+                Show-NpmCertHint ($npmOut -join "`n") | Out-Null
+                throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
+            }
+        } else {
+            Write-Success "Desktop workspace dependencies installed"
         }
-        Write-Success "Desktop workspace dependencies installed"
     } catch {
         if ($prevEAP) { $ErrorActionPreference = $prevEAP }
         Pop-Location
@@ -2383,13 +2413,13 @@ function Install-Desktop {
             # once; @electron/get re-downloads with its own SHASUM check. Without
             # this a corrupt download hard-fails the whole installer.
             $purged = @(Clear-ElectronBuildCache -DesktopDir $desktopDir)
-            # electronDist is pinned to node_modules\electron\dist (#38673):
-            # electron-builder reads the Electron binary from there and `pack`
-            # never downloads it, so purging the cache + re-running pack can't by
-            # itself repopulate a missing/partial dist. When the dist is actually
-            # gone, re-run electron's own downloader so the retry has a binary to
-            # read. Gated on the dist check so an unrelated build failure
-            # (tsc/vite) doesn't trigger a pointless ~200MB refetch.
+            # The build reuses the already-unpacked electron dist when present
+            # (resolved dynamically by scripts\run-electron-builder.cjs, #38673),
+            # so purging the build cache + re-running pack can't by itself
+            # repopulate a missing/partial dist. When the dist is actually gone,
+            # re-run electron's own downloader so the retry has a binary to reuse.
+            # Gated on the dist check so an unrelated build failure (tsc/vite)
+            # doesn't trigger a pointless ~200MB refetch.
             $restored = $false
             if (-not (Test-ElectronDist -InstallDir $InstallDir)) {
                 $restored = Restore-ElectronDist -InstallDir $InstallDir
@@ -2410,22 +2440,25 @@ function Install-Desktop {
         # trade-off we only make AFTER the canonical GitHub download has failed,
         # and we never override a user-pinned ELECTRON_MIRROR.
         if ($code -ne 0 -and -not $env:ELECTRON_MIRROR) {
-            $mirror = "https://npmmirror.com/mirrors/electron/"
+            $mirror = $script:DesktopElectronFallbackMirror
             Write-Warn "Desktop build still failing - the Electron download from GitHub looks blocked."
             Write-Warn "Re-downloading Electron via a public mirror ($mirror), then rebuilding:"
             Write-Info "  (set ELECTRON_MIRROR yourself to use a different/trusted mirror)"
-            # electronDist is pinned (#38673), so `npm run pack` never downloads
-            # Electron - the mirror only helps if it drives electron's own
-            # downloader. Re-fetch the binary through the mirror first; otherwise
-            # the retry just re-reads the same missing dist and re-throws
-            # "The specified electronDist does not exist" (#47266).
-            $haveDist = Test-ElectronDist -InstallDir $InstallDir
-            if (-not $haveDist) { $haveDist = Restore-ElectronDist -InstallDir $InstallDir -Mirror $mirror }
-            if ($haveDist) {
+            # Pre-fetch the binary through the mirror via electron's own downloader
+            # so the retry has a dist to reuse. If that can't be populated, still
+            # retry the pack under ELECTRON_MIRROR: the build resolves electronDist
+            # dynamically and, when the dist is absent, lets electron-builder fetch
+            # Electron itself via @electron/get, which honors ELECTRON_MIRROR (#47266).
+            if (-not (Test-ElectronDist -InstallDir $InstallDir)) {
+                Restore-ElectronDist -InstallDir $InstallDir -Mirror $mirror | Out-Null
+            }
+            $prevMirror = $env:ELECTRON_MIRROR
+            $env:ELECTRON_MIRROR = $mirror
+            try {
                 & $npmExe run pack 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $buildLog
                 $code = $LASTEXITCODE
-            } else {
-                Write-Warn "Could not re-download Electron from the mirror (node_modules\electron\dist still missing)"
+            } finally {
+                $env:ELECTRON_MIRROR = $prevMirror
             }
         }
         $ErrorActionPreference = $prevEAP
