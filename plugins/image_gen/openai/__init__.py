@@ -171,6 +171,29 @@ class OpenAIImageGenProvider(ImageGenProvider):
             ],
         }
 
+    @staticmethod
+    def _edit(client: Any, payload: Dict[str, Any], reference_images: List[str]) -> Any:
+        """Run gpt-image-2 image *edit* grounded on reference image(s).
+
+        ``images.edit`` keeps the output anchored to the supplied character,
+        which is what makes per-state pet rows stay the same creature. Opens the
+        reference files as binary handles and forwards the same size/quality/
+        background knobs as ``images.generate``.
+        """
+        handles = [open(path, "rb") for path in reference_images]
+        try:
+            edit_payload = dict(payload)
+            # The edit endpoint takes one image or a list; a single handle is
+            # the broadly-supported shape.
+            edit_payload["image"] = handles if len(handles) > 1 else handles[0]
+            return client.images.edit(**edit_payload)
+        finally:
+            for handle in handles:
+                try:
+                    handle.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     def generate(
         self,
         prompt: str,
@@ -223,9 +246,20 @@ class OpenAIImageGenProvider(ImageGenProvider):
             "quality": meta["quality"],
         }
 
+        # Optional sprite-oriented extras (used by pet generation; ignored by
+        # the prompt-only ``image_generate`` tool). ``background=transparent``
+        # asks gpt-image for a cutout; ``reference_images`` routes to the image
+        # *edit* endpoint so the output stays grounded on a base character.
+        if str(kwargs.get("background", "")).lower() == "transparent":
+            payload["background"] = "transparent"
+        reference_images = kwargs.get("reference_images") or []
+
         try:
             client = openai.OpenAI()
-            response = client.images.generate(**payload)
+            if reference_images:
+                response = self._edit(client, payload, reference_images)
+            else:
+                response = client.images.generate(**payload)
         except Exception as exc:
             logger.debug("OpenAI image generation failed", exc_info=True)
             return error_response(

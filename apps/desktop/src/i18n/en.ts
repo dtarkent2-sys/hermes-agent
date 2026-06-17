@@ -751,6 +751,21 @@ export const en: Translations = {
       toggleFailed: 'Could not toggle the pet.',
       noneAvailable: 'No pets available — pick one below to install.'
     },
+    generatePet: {
+      title: 'Generate a pet',
+      placeholder: 'Describe a pet to generate…',
+      promptHint: 'Type a description, then press Enter to draft four looks.',
+      readyHint: 'Press Enter to draft four looks from your description.',
+      generate: 'Generate',
+      generating: 'Generating…',
+      retry: 'Retry',
+      hatch: 'Hatch',
+      hatching: 'Hatching your pet…',
+      namePlaceholder: 'Name your pet',
+      staleBackend: 'Update Hermes to generate pets.',
+      adopt: 'Adopt',
+      startOver: 'Start over'
+    },
     installTheme: {
       title: 'Install theme...',
       placeholder: 'Search the VS Code Marketplace...',

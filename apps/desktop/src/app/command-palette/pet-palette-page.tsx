@@ -15,7 +15,7 @@ import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { PetThumb } from '@/components/pet/pet-thumb'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { Check, Loader2, PawPrint } from '@/lib/icons'
+import { Check, Egg, Loader2, PawPrint } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
   $petBusy,
@@ -31,9 +31,11 @@ import {
 
 interface PetPalettePageProps {
   search: string
+  /** Navigate to the "generate a pet" page (rendered as a header action). */
+  onGenerate?: () => void
 }
 
-export function PetPalettePage({ search }: PetPalettePageProps) {
+export function PetPalettePage({ search, onGenerate }: PetPalettePageProps) {
   const { t } = useI18n()
   const copy = t.commandCenter.pets
   const { requestGateway } = useGatewayRequest()
@@ -72,6 +74,24 @@ export function PetPalettePage({ search }: PetPalettePageProps) {
 
   return (
     <div role="listbox">
+      {onGenerate && (
+        <button
+          className={cn(
+            'flex w-full items-center gap-2 rounded-md text-left text-foreground transition-colors hover:bg-(--chrome-action-hover)',
+            HUD_ITEM,
+            HUD_TEXT
+          )}
+          onClick={onGenerate}
+          onMouseDown={event => event.preventDefault()}
+          type="button"
+        >
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-(--chrome-action-hover)">
+            <Egg className="size-4" />
+          </span>
+          <span className="font-medium">{t.commandCenter.generatePet.title}</span>
+        </button>
+      )}
+
       {error && <p className="px-2 pb-1 pt-1.5 text-[0.6875rem] text-(--ui-red)">{error}</p>}
 
       {shown.length === 0 ? (

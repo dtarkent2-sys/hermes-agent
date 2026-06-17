@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { HUD_HEADING, HUD_ITEM, HUD_POSITION, HUD_SURFACE, HUD_TEXT } from '@/app/floating-hud'
+import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { KbdCombo } from '@/components/ui/kbd'
@@ -20,6 +21,7 @@ import {
   Clock,
   Cpu,
   Download,
+  Egg,
   Globe,
   type IconComponent,
   Info,
@@ -42,6 +44,7 @@ import {
 import { cn } from '@/lib/utils'
 import { $commandPaletteOpen, $commandPalettePage, closeCommandPalette, setCommandPaletteOpen } from '@/store/command-palette'
 import { $bindings } from '@/store/keybinds'
+import { $petGenStatus, cleanupPetGen, generateDrafts } from '@/store/pet-generate'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
@@ -63,6 +66,7 @@ import { fieldCopyForSchemaKey } from '../settings/field-copy'
 import { prettyName } from '../settings/helpers'
 
 import { MarketplaceThemePage } from './marketplace-theme-page'
+import { PetGeneratePage } from './pet-generate-page'
 import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
 
 interface PaletteItem {
@@ -89,7 +93,7 @@ interface PaletteGroup {
 
 // Nested page → its parent, so Back / Esc step up one level instead of closing
 // the palette. Pages absent here go straight back to the root list.
-const PAGE_PARENTS: Record<string, string> = { 'install-theme': 'theme' }
+const PAGE_PARENTS: Record<string, string> = { 'generate-pet': 'pets', 'install-theme': 'theme' }
 
 /** A nested page reachable from a root item via `to`. */
 interface PalettePage {
@@ -210,6 +214,7 @@ export function CommandPalette() {
   const pendingPage = useStore($commandPalettePage)
   const bindings = useStore($bindings)
   const navigate = useNavigate()
+  const { requestGateway } = useGatewayRequest()
   const { availableThemes, resolvedMode, setMode, setTheme, themeName } = useTheme()
   const [search, setSearch] = useState('')
   const [page, setPage] = useState<string | null>(null)
@@ -245,13 +250,15 @@ export function CommandPalette() {
   const sessions = useMemo(() => (sessionsQuery.data?.sessions ?? []).map(toSessionEntry), [sessionsQuery.data])
   const archivedSessions = useMemo(() => (archivedQuery.data?.sessions ?? []).map(toSessionEntry), [archivedQuery.data])
 
-  // Reset the query/sub-page on close so it reopens clean.
+  // Reset the query/sub-page on close so it reopens clean. Cleanup also deletes
+  // a hatched-but-unadopted preview pet so it doesn't linger in the gallery.
   useEffect(() => {
     if (!open) {
       setSearch('')
       setPage(null)
+      cleanupPetGen(requestGateway)
     }
-  }, [open])
+  }, [open, requestGateway])
 
   // Deep-link into a nested page (e.g. `/pet list` → pets picker).
   useEffect(() => {
@@ -400,6 +407,13 @@ export function CommandPalette() {
             keywords: ['pet', 'petdex', 'mascot', 'pets', '/pet', 'paw'],
             label: cc.pets.title,
             to: 'pets'
+          },
+          {
+            icon: Egg,
+            id: 'appearance-generate-pet',
+            keywords: ['pet', 'generate', 'create', 'make', 'new pet', 'mascot', 'hatch', 'ai'],
+            label: cc.generatePet.title,
+            to: 'generate-pet'
           }
         ]
       },
@@ -574,6 +588,12 @@ export function CommandPalette() {
         placeholder: t.commandCenter.pets.placeholder,
         groups: []
       },
+      // Server-driven page: describe → draft variants → hatch a custom pet.
+      'generate-pet': {
+        title: t.commandCenter.generatePet.title,
+        placeholder: t.commandCenter.generatePet.placeholder,
+        groups: []
+      },
       // Server-driven page: items come from the Marketplace, rendered by
       // <MarketplaceThemePage> (loader + live search + per-row install).
       'install-theme': {
@@ -644,6 +664,21 @@ export function CommandPalette() {
                   event.preventDefault()
                   event.stopPropagation()
                   goBack()
+
+                  return
+                }
+
+                // On the generate page, Enter (re)generates from the typed
+                // concept — cmdk has no item to select there, so each Enter,
+                // including a retype after drafts already exist, starts a fresh
+                // round. The page's own Retry/Hatch buttons cover the rest.
+                if (page === 'generate-pet' && event.key === 'Enter' && search.trim()) {
+                  const genStatus = $petGenStatus.get()
+
+                  if (genStatus !== 'generating' && genStatus !== 'hatching') {
+                    event.preventDefault()
+                    void generateDrafts(requestGateway, { prompt: search })
+                  }
                 }
               }}
               onValueChange={setSearch}
@@ -653,8 +688,10 @@ export function CommandPalette() {
             />
             <CommandList className="dt-portal-scrollbar max-h-[min(20rem,56vh)]">
               {/* Server-driven pages render their own list; the rest show groups. */}
-              {page === 'pets' ? (
-                <PetPalettePage search={search} />
+              {page === 'generate-pet' ? (
+                <PetGeneratePage search={search} />
+              ) : page === 'pets' ? (
+                <PetPalettePage onGenerate={() => { setSearch(''); setPage('generate-pet') }} search={search} />
               ) : page === 'install-theme' ? (
                 <MarketplaceThemePage onPickTheme={setTheme} search={search} />
               ) : (

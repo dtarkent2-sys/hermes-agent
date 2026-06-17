@@ -15,6 +15,12 @@ interface PetSpriteProps {
   info: PetInfo
   /** On-screen scale multiplier applied on top of the pet's native scale. */
   zoom?: number
+  /**
+   * Force a specific animation state instead of reading the live `$petState`.
+   * Used by the generate-flow preview to showcase every row without driving (or
+   * being driven by) the real agent activity that moves the floating mascot.
+   */
+  stateOverride?: PetState
 }
 
 /**
@@ -28,9 +34,15 @@ interface PetSpriteProps {
  * with `memo`, this component effectively never re-renders after mount until
  * the pet itself changes.
  */
-function PetSpriteImpl({ info, zoom = 1 }: PetSpriteProps) {
+function PetSpriteImpl({ info, zoom = 1, stateOverride }: PetSpriteProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const stateRef = useRef<PetState>($petState.get())
+  const overrideRef = useRef<PetState | undefined>(stateOverride)
+
+  // Keep the override current without re-running the RAF setup effect.
+  useEffect(() => {
+    overrideRef.current = stateOverride
+  }, [stateOverride])
 
   const frameW = info.frameW ?? DEFAULT_FRAME_W
   const frameH = info.frameH ?? DEFAULT_FRAME_H
@@ -91,6 +103,7 @@ function PetSpriteImpl({ info, zoom = 1 }: PetSpriteProps) {
     // than flashing blank padding.
     const resolve = (s: PetState): { row: number; count: number } => {
       const real = framesByState?.[s] ?? frames
+
       if (real > 0) {
         return { row: rowIndex(s), count: real }
       }
@@ -99,7 +112,7 @@ function PetSpriteImpl({ info, zoom = 1 }: PetSpriteProps) {
     }
 
     const render = (now: number) => {
-      const { row, count } = resolve(stateRef.current)
+      const { row, count } = resolve(overrideRef.current ?? stateRef.current)
       // Per-state step keeps every state's loop ~loopMs even when frame counts
       // differ; counts vary per row so derive the cadence here, not once.
       const stepMs = loopMs / count

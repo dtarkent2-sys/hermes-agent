@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,6 +171,77 @@ def install_pet(slug: str, *, force: bool = False, timeout: float = _DOWNLOAD_TI
     pet = load_pet(slug)
     if pet is None or not pet.exists:
         raise PetStoreError(f"install of '{slug}' did not produce a spritesheet")
+    return pet
+
+
+def slugify(name: str) -> str:
+    """Lowercase, hyphenate, and strip a display name into a filesystem slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-")
+    return slug or "pet"
+
+
+def unique_slug(name: str) -> str:
+    """A :func:`slugify` result that doesn't collide with an existing pet dir."""
+    base = slugify(name)
+    slug = base
+    counter = 2
+    while (pets_dir() / slug).exists():
+        slug = f"{base}-{counter}"
+        counter += 1
+    return slug
+
+
+def _write_spritesheet(source, dest: Path) -> None:
+    """Write *source* (PIL image, bytes, or path) as a lossless WebP at *dest*."""
+    if isinstance(source, (bytes, bytearray)):
+        dest.write_bytes(bytes(source))
+        return
+
+    from PIL import Image
+
+    if isinstance(source, (str, Path)):
+        with Image.open(source) as opened:
+            image = opened.convert("RGBA")
+    else:
+        image = source.convert("RGBA")
+    image.save(dest, format="WEBP", lossless=True, quality=100, method=6, exact=True)
+
+
+def register_local_pet(
+    spritesheet,
+    *,
+    slug: str,
+    display_name: str = "",
+    description: str = "",
+) -> InstalledPet:
+    """Write a locally-generated pet into the store and return it.
+
+    *spritesheet* may be a PIL image, raw WebP/PNG bytes, or a path. The pet
+    appears in :func:`installed_pets` immediately, and because :func:`install_pet`
+    returns an already-on-disk pet before consulting the manifest, it can be
+    adopted (``pet.select`` / ``/pet <slug>``) without a manifest entry.
+    """
+    slug = slugify(slug)
+    directory = pets_dir() / slug
+    directory.mkdir(parents=True, exist_ok=True)
+    sprite_path = directory / "spritesheet.webp"
+    try:
+        _write_spritesheet(spritesheet, sprite_path)
+    except Exception as exc:  # noqa: BLE001 - normalize to one error type
+        raise PetStoreError(f"could not write spritesheet for '{slug}': {exc}") from exc
+
+    meta = {
+        "id": slug,
+        "displayName": display_name or slug,
+        "description": description or "",
+        "spritesheetPath": sprite_path.name,
+        "createdBy": "generator",
+    }
+    (directory / "pet.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    pet = load_pet(slug)
+    if pet is None or not pet.exists:
+        raise PetStoreError(f"register of generated pet '{slug}' did not produce a spritesheet")
     return pet
 
 

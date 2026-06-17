@@ -846,6 +846,21 @@ export const zhHant = defineLocale({
       toggleFailed: '無法切換寵物顯示。',
       noneAvailable: '尚無可用寵物——請在下方選擇一個安裝。'
     },
+    generatePet: {
+      title: '生成寵物',
+      placeholder: '描述要生成的寵物……',
+      promptHint: '輸入描述，然後按 Enter 生成四種造型。',
+      readyHint: '按 Enter 依描述生成四種造型。',
+      generate: '生成',
+      generating: '生成中……',
+      retry: '重試',
+      hatch: '孵化',
+      hatching: '正在孵化你的寵物……',
+      namePlaceholder: '為寵物命名',
+      staleBackend: '請更新 Hermes 以生成寵物。',
+      adopt: '領養',
+      startOver: '重新開始'
+    },
     installTheme: {
       title: '安裝主題...',
       placeholder: '搜尋 VS Code Marketplace...',

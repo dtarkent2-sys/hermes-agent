@@ -939,6 +939,21 @@ export const zh: Translations = {
       toggleFailed: '无法切换宠物显示。',
       noneAvailable: '暂无可用宠物——请在下方选择一个安装。'
     },
+    generatePet: {
+      title: '生成宠物',
+      placeholder: '描述要生成的宠物……',
+      promptHint: '输入描述，然后按 Enter 生成四种造型。',
+      readyHint: '按 Enter 根据描述生成四种造型。',
+      generate: '生成',
+      generating: '生成中……',
+      retry: '重试',
+      hatch: '孵化',
+      hatching: '正在孵化你的宠物……',
+      namePlaceholder: '给宠物起个名字',
+      staleBackend: '请更新 Hermes 以生成宠物。',
+      adopt: '领养',
+      startOver: '重新开始'
+    },
     installTheme: {
       title: '安装主题...',
       placeholder: '搜索 VS Code Marketplace...',

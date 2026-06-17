@@ -875,6 +875,21 @@ export const ja = defineLocale({
       toggleFailed: 'ペットを切り替えできませんでした。',
       noneAvailable: '利用可能なペットがありません。'
     },
+    generatePet: {
+      title: 'ペットを生成',
+      placeholder: '生成するペットを説明…',
+      promptHint: '説明を入力して Enter を押すと、4 つの見た目を生成します。',
+      readyHint: 'Enter を押すと、説明から 4 つの見た目を生成します。',
+      generate: '生成',
+      generating: '生成中…',
+      retry: '再試行',
+      hatch: '孵化',
+      hatching: 'ペットを孵化しています…',
+      namePlaceholder: 'ペットに名前を付ける',
+      staleBackend: 'ペットを生成するには Hermes を更新してください。',
+      adopt: '迎え入れる',
+      startOver: 'やり直す'
+    },
     installTheme: {
       title: 'テーマをインストール...',
       placeholder: 'VS Code Marketplace を検索...',

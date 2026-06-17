@@ -627,6 +627,21 @@ export interface Translations {
       toggleFailed: string
       noneAvailable: string
     }
+    generatePet: {
+      title: string
+      placeholder: string
+      promptHint: string
+      readyHint: string
+      generate: string
+      generating: string
+      retry: string
+      hatch: string
+      hatching: string
+      namePlaceholder: string
+      staleBackend: string
+      adopt: string
+      startOver: string
+    }
     installTheme: {
       title: string
       placeholder: string
