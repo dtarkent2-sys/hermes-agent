@@ -1765,11 +1765,20 @@ def init_agent(
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
 
-    # Skills config: nudge interval for skill creation reminders
+    # Skills config: nudge interval and always-on index detail level.
     agent._skill_nudge_interval = 10
+    agent._skill_index_mode = "full"
     try:
         skills_config = _agent_cfg.get("skills", {})
         agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+        _skill_index_mode = str(skills_config.get("index_mode", "full") or "full").strip().lower()
+        if _skill_index_mode in {"full", "names"}:
+            agent._skill_index_mode = _skill_index_mode
+        else:
+            logger.warning(
+                "Invalid skills.index_mode=%r; expected 'full' or 'names'. Using full.",
+                skills_config.get("index_mode"),
+            )
     except Exception:
         pass
 

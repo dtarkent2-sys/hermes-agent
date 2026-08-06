@@ -54,6 +54,19 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
     assert data["system_prompt"]["bytes"] > 0
 
 
+def test_inspection_agent_honors_cli_coding_focus(isolated_home):
+    """The diagnostic uses the same focused toolset as a real CLI session."""
+    (isolated_home / "config.yaml").write_text(
+        "agent:\n  coding_context: focus\n",
+        encoding="utf-8",
+    )
+    Path("AGENTS.md").write_text("# Coding workspace\n", encoding="utf-8")
+
+    agent = _build_inspection_agent("cli")
+
+    assert agent.enabled_toolsets == ["coding"]
+
+
 
 
 

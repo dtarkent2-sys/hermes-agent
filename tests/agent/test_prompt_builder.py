@@ -314,6 +314,33 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_names_only_keeps_all_skills_without_descriptions(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, name, description in (
+            ("coding", "alpha-skill", "Alpha description"),
+            ("finance", "beta-skill", "Beta description"),
+        ):
+            skill_dir = tmp_path / "skills" / category / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n",
+                encoding="utf-8",
+            )
+
+        compact = build_skills_system_prompt(names_only=True)
+
+        assert "alpha-skill" in compact
+        assert "beta-skill" in compact
+        assert "Alpha description" not in compact
+        assert "Beta description" not in compact
+        assert "loaded progressively" in compact
+        # Full mode must remain a distinct cache entry.
+        full = build_skills_system_prompt()
+        assert "Alpha description" in full
+        assert "Beta description" in full
+
 
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):

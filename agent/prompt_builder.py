@@ -1603,6 +1603,7 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    names_only: bool = False,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1623,6 +1624,10 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    ``names_only`` applies the same progressive-loading treatment to every
+    category. All skill names remain visible while descriptions load only via
+    ``skill_view`` or ``skills_list``.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1643,6 +1648,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        bool(names_only),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1813,13 +1819,22 @@ def build_skills_system_prompt(
     # what the index stops showing them. Match on the top-level category
     # segment so nested categories ("social-media/twitter") are demoted with
     # their parent.
-    demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
+    demoted = (
+        frozenset(skills_by_category)
+        if names_only
+        else frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] in (compact_categories or frozenset())
+        )
     )
 
     hidden_note = ""
-    if demoted:
+    if names_only and demoted:
+        hidden_note = (
+            "\n(All skill descriptions are loaded progressively. Every skill "
+            "remains available through skill_view(name) and skills_list().)"
+        )
+    elif demoted:
         hidden_note = (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "

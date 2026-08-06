@@ -1,14 +1,14 @@
 """Progressive tool disclosure ("tool search") for Hermes Agent.
 
-When enabled, MCP and non-core plugin tools are replaced in the model-visible
-tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
+When enabled, MCP and plugin tools are replaced in the model-visible tools
+array by three bridge tools and surfaced on demand. Core Hermes tools remain
+eager by default and can be progressively deferred with explicit config.
 
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
 
-* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
+* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` stay eager by default.
+  ``defer_core`` is opt-in and preserves a small agent-state bootstrap set.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -58,6 +58,13 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
+# These tools require agent-loop state or provide the skill-loading bootstrap.
+# They remain direct even when optional core deferral is enabled.
+DEFAULT_EAGER_CORE_TOOLS = frozenset({
+    "todo", "memory", "session_search", "delegate_task",
+    "skills_list", "skill_view",
+})
+
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
 # per token for English+JSON. Underestimating leads to false negatives
@@ -96,6 +103,10 @@ class ToolSearchConfig:
     # Absolute cap on the embedded listing, regardless of context size.
     # Effective budget = min(listing_max_tokens, threshold_pct% of context).
     listing_max_tokens: int = 4000
+    # Opt-in progressive disclosure for built-in tools. The default keeps the
+    # historical behavior. Agent-state and skill-bootstrap tools stay eager.
+    defer_core: bool = False
+    eager_core_tools: frozenset[str] = DEFAULT_EAGER_CORE_TOOLS
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -145,6 +156,15 @@ class ToolSearchConfig:
             listing = "auto"
         listing_max_tokens = max(200, min(60000, _safe_int(raw.get("listing_max_tokens"), 4000)))
 
+        defer_core = bool(raw.get("defer_core", False))
+        eager_raw = raw.get("eager_core_tools")
+        if isinstance(eager_raw, (list, tuple, set, frozenset)):
+            eager_core_tools = frozenset(
+                str(name).strip() for name in eager_raw if str(name).strip()
+            ) | DEFAULT_EAGER_CORE_TOOLS
+        else:
+            eager_core_tools = DEFAULT_EAGER_CORE_TOOLS
+
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
@@ -152,6 +172,8 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=listing,
             listing_max_tokens=listing_max_tokens,
+            defer_core=defer_core,
+            eager_core_tools=eager_core_tools,
         )
 
 
@@ -201,18 +223,21 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-def is_deferrable_tool_name(name: str) -> bool:
+def is_deferrable_tool_name(
+    name: str,
+    config: Optional[ToolSearchConfig] = None,
+) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
-    A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    MCP and plugin tools are deferrable. Core tools are deferrable only when
+    ``defer_core`` is explicitly enabled and the tool is not in the protected
+    eager bootstrap set.
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
     if name in _core_tool_names():
-        return False
+        resolved = config or load_config()
+        return resolved.defer_core and name not in resolved.eager_core_tools
     # Check registry toolset for MCP prefix.
     try:
         from tools.registry import registry
@@ -227,7 +252,10 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    config: Optional[ToolSearchConfig] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
@@ -243,7 +271,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if is_deferrable_tool_name(name, config=config):
             deferrable.append(td)
         else:
             visible.append(td)

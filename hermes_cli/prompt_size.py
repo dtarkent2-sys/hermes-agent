@@ -62,8 +62,19 @@ def _build_inspection_agent(platform: str) -> Any:
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     model = model_cfg.get("default") or model_cfg.get("model") or ""
 
-    # Resolve platform-specific toolsets the same way the gateway does.
-    enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
+    # Resolve toolsets the same way a real session does. The interactive CLI
+    # applies the coding posture before falling back to platform toolsets; the
+    # diagnostic must do the same or it over-reports schemas that never ship.
+    enabled_toolsets = None
+    if platform == "cli":
+        try:
+            from agent.coding_context import coding_selection
+
+            enabled_toolsets = coding_selection(platform=platform, config=cfg)
+        except Exception:
+            enabled_toolsets = None
+    if enabled_toolsets is None:
+        enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
     agent_cfg = cfg.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
