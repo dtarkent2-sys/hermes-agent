@@ -769,24 +769,29 @@ def _preflight_codex_input_items(
         item_type = item.get("type")
         if item_type == "function_call":
             call_id = item.get("call_id")
-            name = item.get("name")
             if not isinstance(call_id, str) or not call_id.strip():
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing call_id.")
+            name = item.get("name")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing name.")
-
+            
+            # Sanitize name to match pattern '^[a-zA-Z0-9_-]+$'
+            sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name.strip())
+            if not sanitized_name:
+                raise ValueError(f"Codex Responses input[{idx}] function_call name contains no valid characters.")
+            
             arguments = item.get("arguments", "{}")
             if isinstance(arguments, dict):
                 arguments = json.dumps(arguments, ensure_ascii=False)
             elif not isinstance(arguments, str):
                 arguments = str(arguments)
             arguments = sanitize_text(arguments.strip() or "{}")
-
+            
             normalized.append(
                 {
                     "type": "function_call",
                     "call_id": call_id.strip(),
-                    "name": name.strip(),
+                    "name": sanitized_name,
                     "arguments": arguments,
                 }
             )

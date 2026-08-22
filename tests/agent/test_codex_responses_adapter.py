@@ -227,49 +227,6 @@ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
     assert assistant_message.codex_reasoning_items is None
 
 
-
-
-# ---------------------------------------------------------------------------
-# Server-side built-in tool calls (xAI native web_search, code interpreter,
-# etc.) come back as discrete ``*_call`` output items that xAI's
-# /v1/responses surface routinely leaves at ``status="in_progress"`` even
-# when the overall ``response.status == "completed"``.  These must NOT mark
-# the turn incomplete — otherwise grok-composer-2.5-fast research queries
-# (which invoke server-side web_search) get misclassified as
-# ``finish_reason="incomplete"`` and burn 3 fruitless continuation retries
-# before failing with "Codex response remained incomplete after 3
-# continuation attempts".  Observed live against grok-composer-2.5-fast on
-# SuperGrok OAuth (2026-06).
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# Replayed assistant message items with an oversized server-assigned ``id``
-# (Codex issues 400+ char base64 blobs) must never reach the API — the
-# Responses endpoint caps input[].id at 64 chars and rejects the whole
-# request with a non-retryable HTTP 400, permanently bricking the session
-# (every subsequent turn replays the same bad id). Short ids (msg_...) are
-# still worth keeping for prefix-cache hits, so this is a length guard, not
-# a blanket strip.
-# ---------------------------------------------------------------------------
-
-_OVERSIZED_ITEM_ID = "x" * 408
-_VALID_ITEM_ID = "msg_abc123"
-
-
-
-
-
-
-# The codex app-server overflows the Responses 64-char call_id limit for
-# MCP-routed tools, e.g. codex_mcp__hermes-tools__web_search_exec-<uuid> (#73492).
-_OVERSIZED_CALL_ID = "codex_mcp__hermes-tools__web_search_exec-" + "0" * 43
-
-
 def test_chat_messages_to_responses_input_clamps_oversized_call_id():
     """An oversized call_id must be clamped to <=64 chars on BOTH the
     function_call and its matching function_call_output, to the same surrogate,
@@ -280,14 +237,14 @@ def test_chat_messages_to_responses_input_clamps_oversized_call_id():
             "content": "",
             "tool_calls": [
                 {
-                    "call_id": _OVERSIZED_CALL_ID,
+                    "call_id": "codex_mcp__hermes-tools__web_search_exec-" + "0" * 43,
                     "function": {"name": "web_search", "arguments": "{}"},
                 }
             ],
         },
         {
             "role": "tool",
-            "tool_call_id": _OVERSIZED_CALL_ID,
+            "tool_call_id": "codex_mcp__hermes-tools__web_search_exec-" + "0" * 43,
             "content": "some result",
         },
     ]
@@ -298,7 +255,7 @@ def test_chat_messages_to_responses_input_clamps_oversized_call_id():
     output = next(i for i in items if i.get("type") == "function_call_output")
 
     assert len(call["call_id"]) <= 64
-    assert call["call_id"] != _OVERSIZED_CALL_ID
+    assert call["call_id"] != "codex_mcp__hermes-tools__web_search_exec-" + "0" * 43
     # Deterministic surrogate — the pair must still reference the same id.
     assert call["call_id"] == output["call_id"]
 
@@ -331,10 +288,6 @@ def test_chat_messages_to_responses_input_keeps_short_call_id():
     assert output["call_id"] == "call_abc123"
 
 
-
-
-
-
 def test_preflight_codex_input_items_drops_short_id_for_github_responses():
     items = _preflight_codex_input_items(
         [
@@ -343,7 +296,7 @@ def test_preflight_codex_input_items_drops_short_id_for_github_responses():
                 "role": "assistant",
                 "status": "in_progress",
                 "content": [{"type": "output_text", "text": "pong"}],
-                "id": _VALID_ITEM_ID,
+                "id": "msg_abc123",
                 "phase": "final_answer",
             }
         ],
@@ -368,7 +321,7 @@ def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
                     "role": "assistant",
                     "status": "completed",
                     "content": [{"type": "output_text", "text": "pong"}],
-                    "id": _OVERSIZED_ITEM_ID,
+                    "id": "x" * 408,
                     "phase": "final_answer",
                 },
             ],
@@ -379,15 +332,6 @@ def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
 
     message_item = next(item for item in kwargs["input"] if item.get("type") == "message")
     assert "id" not in message_item
-
-
-# ---------------------------------------------------------------------------
-# _preflight_codex_api_kwargs — built-in (provider-executed) tools must pass
-# through validation.  Regression guard for the xAI native web_search
-# injection: the preflight validator previously rejected any tool whose
-# ``type != "function"`` with "unsupported type", which would 400 every xAI
-# turn once the native web_search tool is declared.
-# ---------------------------------------------------------------------------
 
 
 def test_preflight_passes_native_web_search_tool_through():
@@ -408,43 +352,15 @@ def test_preflight_passes_native_web_search_tool_through():
     assert any(t.get("type") == "function" and t.get("name") == "read_file" for t in tools)
 
 
-
-
-# ---------------------------------------------------------------------------
-# _format_responses_error — adapted from anomalyco/opencode#28757.
-# Provider failures should surface BOTH the code (rate_limit_exceeded /
-# context_length_exceeded / internal_error / server_error) and the message,
-# so consumers can tell rate limits apart from context-length failures and
-# both apart from generic stream drops.
-# ---------------------------------------------------------------------------
-
-
-
-
 def test_format_responses_error_message_only():
     err = {"message": "Upstream model unavailable"}
     assert _format_responses_error(err, "failed") == "Upstream model unavailable"
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_normalize_codex_response_failed_includes_code_in_error():
     """Regression: response_status == 'failed' should surface the error
     code, not just the message. Used to leak a bare 'Slow down' string
     that was indistinguishable from a generic stream truncation."""
-    # ``output`` non-empty so we don't trip the "no output items" guard
-    # before reaching the failed-status branch. Real failed responses
-    # often DO carry a partial message item alongside the error.
     response = SimpleNamespace(
         status="failed",
         output=[
@@ -461,20 +377,6 @@ def test_normalize_codex_response_failed_includes_code_in_error():
         _normalize_codex_response(response)
 
 
-
-
-# ---------------------------------------------------------------------------
-# Reasoning-channel answer salvage (xAI grok) — grok-4.x on the xAI
-# /v1/responses surface sometimes emits its final answer inside the
-# reasoning item, delimited by grok's internal "<response>" tag, with no
-# ``message`` output item at all.  Because those reasoning items carry no
-# encrypted_content, the interim message replays as nothing and every
-# continuation request is byte-identical — the turn burns 3 retries and
-# fails even though the answer was produced.  Observed live with grok-4.20
-# on xai-oauth (2026-07-13).
-# ---------------------------------------------------------------------------
-
-
 def _xai_reasoning_only_response(reasoning_text):
     return SimpleNamespace(
         status="completed",
@@ -487,3 +389,27 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
+
+def test_codex_preflight_name_sanitization():
+    # Dotted MCP name -> underscored
+    raw = [{"type": "function_call", "call_id": "c1", "name": "mcp.hugging_face.hf_fs", "arguments": "{}"}]
+    normalized = _preflight_codex_input_items(raw)
+    assert normalized[0]["name"] == "mcp_hugging_face_hf_fs"
+
+    # Legit name stays unchanged
+    raw = [{"type": "function_call", "call_id": "c2", "name": "my_tool-1_x", "arguments": "{}"}]
+    normalized = _preflight_codex_input_items(raw)
+    assert normalized[0]["name"] == "my_tool-1_x"
+
+    # Blank/missing name still raises ValueError
+    with pytest.raises(ValueError, match="missing name"):
+        _preflight_codex_input_items([{"type": "function_call", "call_id": "c3", "name": " ", "arguments": "{}"}])
+    with pytest.raises(ValueError, match="missing name"):
+        _preflight_codex_input_items([{"type": "function_call", "call_id": "c4", "name": None, "arguments": "{}"}])
+
+def test_codex_preflight_call_id_guard():
+    # Missing call_id raises ValueError, not AttributeError
+    with pytest.raises(ValueError, match="missing call_id"):
+        _preflight_codex_input_items([{"type": "function_call", "call_id": None, "name": "tool", "arguments": "{}"}])
+    with pytest.raises(ValueError, match="missing call_id"):
+        _preflight_codex_input_items([{"type": "function_call", "call_id": " ", "name": "tool", "arguments": "{}"}])
