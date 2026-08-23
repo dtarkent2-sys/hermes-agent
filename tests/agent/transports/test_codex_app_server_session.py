@@ -745,7 +745,13 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        # monotonic sequence covers: deadline, turn_started_at (TTFB anchor),
+        # iter1 while + ttfb check + last_tool_completion_at, then iter2 while
+        # + post-tool check. The last call (1000.2) trips the post-tool
+        # watchdog; the TTFB watchdog must not fire first.
+        monotonic_values = iter(
+            [1000.0, 1000.0, 999.0, 999.0, 999.0, 999.0, 1000.2]
+        )
         with patch.object(
             session_mod.time,
             "monotonic",
@@ -802,6 +808,113 @@ class TestSessionRetirement:
 
 
 
+
+
+    def test_post_tool_watchdog_does_not_fire_while_tool_in_progress(self):
+        """The exact sq-x-daily-engagement failure: tool A completes (arming
+        the post-tool quiet timer), then tool B starts and runs LONGER than
+        post_tool_quiet_timeout. Codex emits nothing during B's execution, so
+        without an in-progress guard the watchdog would fire off A's stale
+        completion anchor and retire the session mid-side-effect (a browser
+        publish). The in-progress tool must suppress the watchdog, and the
+        turn must complete once B finishes."""
+        client = FakeClient()
+        # Tool A completes → arms last_tool_completion_at.
+        client.queue_notification(
+            "item/started",
+            item={"type": "commandExecution", "id": "exA", "command": "echo a",
+                  "cwd": "/tmp"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "commandExecution", "id": "exA", "command": "echo a",
+                  "cwd": "/tmp", "status": "completed", "aggregatedOutput": "a",
+                  "exitCode": 0, "commandActions": []},
+            threadId="t", turnId="tu1",
+        )
+        # Tool B starts immediately after — long-running (browser publish).
+        client.queue_notification(
+            "item/started",
+            item={"type": "commandExecution", "id": "exB",
+                  "command": "node x_reply_publish.mjs", "cwd": "/tmp"},
+            threadId="t", turnId="tu1",
+        )
+        s = make_session(client)
+
+        # B's completion arrives only AFTER the post-tool quiet window has
+        # passed. Without the fix, B's in-progress state would not suppress
+        # the watchdog and it would fire off exA's stale completion anchor.
+        import threading
+
+        def release_after_silence():
+            time.sleep(0.25)  # > post_tool_quiet_timeout below
+            client.queue_notification(
+                "item/completed",
+                item={"type": "commandExecution", "id": "exB",
+                      "command": "node x_reply_publish.mjs", "cwd": "/tmp",
+                      "status": "completed", "aggregatedOutput": "POSTED_VERIFIED",
+                      "exitCode": 0, "commandActions": []},
+                threadId="t", turnId="tu1",
+            )
+            # codex then emits its final assistant message and completes the
+            # turn — the realistic flow after a finished publish tool.
+            client.queue_notification(
+                "item/completed",
+                item={"type": "agentMessage", "id": "m1",
+                      "text": "All 4 replies published and verified."},
+                threadId="t", turnId="tu1",
+            )
+            client.queue_notification(
+                "turn/completed", threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
+
+        t = threading.Thread(target=release_after_silence, daemon=True)
+        t.start()
+        r = s.run_turn(
+            "publish the replies",
+            turn_timeout=3.0,
+            notification_poll_timeout=0.01,
+            post_tool_quiet_timeout=0.05,  # tiny; must not trip mid-tool
+        )
+        t.join(timeout=5)
+        assert "published" in r.final_text
+        assert r.should_retire is False
+        assert r.interrupted is False
+        assert r.error is None
+        # The turn should have completed, not been interrupted by the watchdog.
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_post_tool_watchdog_still_fires_after_completion_and_true_silence(self):
+        """After a tool COMPLETES and codex then genuinely goes silent (no new
+        tool started), the watchdog must still fire — the fix only suppresses
+        it during an in-progress tool, not after real completion."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            item={"type": "commandExecution", "id": "ex1", "command": "echo a",
+                  "cwd": "/tmp"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "commandExecution", "id": "ex1", "command": "echo a",
+                  "cwd": "/tmp", "status": "completed", "aggregatedOutput": "a",
+                  "exitCode": 0, "commandActions": []},
+            threadId="t", turnId="tu1",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "tool then real silence",
+            turn_timeout=2.0,
+            notification_poll_timeout=0.01,
+            post_tool_quiet_timeout=0.05,
+        )
+        # Tool completed (item/completed seen) then codex went silent past the
+        # quiet window with no new tool → watchdog fires.
+        assert r.should_retire is True
+        assert r.error and "silent" in r.error
 
 
     def test_dead_subprocess_detected_between_iterations(self):
@@ -895,4 +1008,112 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
+
+
+# ---- TTFB / first-byte watchdog (cron "initializing" hang regression) ----
+
+class TestFirstOutputWatchdog:
+    """The codex app-server subprocess can accept turn/start then emit
+    NOTHING for the entire turn (a wedged/admission-stalled backend). With no
+    first-output watchdog, the loop burns the full turn_timeout — which equals
+    the cron inactivity limit — so cron kills the run at `initializing`.
+    These tests pin the TTFB fast-fail that mirrors the `codex_responses`
+    stream path's "no first byte" watchdog.
+    """
+
+    def test_silent_turn_fast_fails_before_turn_deadline(self):
+        """No notification at all → TTFB watchdog trips well before
+        turn_timeout, issues interrupt, and retires the session."""
+        client = FakeClient()
+        s = make_session(client)
+        r = s.run_turn(
+            "silence please",
+            turn_timeout=600.0,  # outer deadline (== cron limit) is long
+            notification_poll_timeout=0.0,
+            first_output_timeout=0.02,
+        )
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "no first byte" in r.error
+        # It must NOT have burned the full 600s turn deadline.
+        assert r.tool_iterations == 0
+        assert r.final_text == ""
+        # interrupt was issued to stop wasted compute
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_first_notification_disarms_watchdog(self):
+        """Once codex emits ANY notification, the TTFB watchdog must not
+        fire even if it later goes quiet (that's the post-tool watchdog's
+        job) — the turn should run to normal completion."""
+        client = FakeClient()
+        # First output arrives immediately, then turn completes normally.
+        client.queue_notification(
+            "turn/started", threadId="t", turn={"id": "tu1"}
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "hello"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "hello",
+            turn_timeout=2.0,
+            notification_poll_timeout=0.01,
+            first_output_timeout=0.02,  # tiny; must be disarmed by first note
+        )
+        assert r.final_text == "hello"
+        assert r.interrupted is False
+        assert r.should_retire is False
+        assert r.error is None
+
+    def test_server_request_disarms_watchdog(self):
+        """A server-initiated request (e.g. an approval) is also live output —
+        it must disarm the TTFB watchdog so codex gets time to keep going."""
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-1",
+            command="pwd",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "needs approval",
+            turn_timeout=2.0,
+            notification_poll_timeout=0.01,
+            first_output_timeout=0.02,
+        )
+        assert r.final_text == "done"
+        assert r.should_retire is False
+        assert r.interrupted is False
+
+    def test_watchdog_disabled_when_timeout_zero(self):
+        """first_output_timeout=0 disables the watchdog entirely, so a silent
+        turn falls through to the outer turn deadline (existing behavior)."""
+        client = FakeClient()
+        s = make_session(client)
+        r = s.run_turn(
+            "silence please",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+            first_output_timeout=0.0,
+        )
+        # Fell through to the turn deadline, not the TTFB watchdog.
+        assert r.error and "timed out after" in r.error
+        assert r.should_retire is True
+
 

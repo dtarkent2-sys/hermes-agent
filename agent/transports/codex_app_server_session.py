@@ -91,6 +91,20 @@ class TurnResult:
 # normal completion path fires. Mirrors openclaw beta.8 fix.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
+# Codex item `type` values that represent an executed tool (as opposed to a
+# plain assistant/reasoning/user message). Mirrors _CODEX_TOOL_ITEM_TYPES in
+# codex_runtime.py. Used by the run_turn loop to track tool *execution* state
+# independently of the projector's completion-only `is_tool_iteration` flag:
+# the post-tool quiet watchdog must not fire while a tool is still running.
+_TOOL_ITEM_TYPES = frozenset(
+    {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+)
+
+
+def _is_tool_item(item: dict) -> bool:
+    """Return whether a codex item represents a (possibly in-flight) tool."""
+    return bool(item) and (item.get("type") in _TOOL_ITEM_TYPES)
+
 
 def _notification_scope_ids(
     note: dict,
@@ -474,6 +488,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        first_output_timeout: Optional[float] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -484,7 +499,30 @@ class CodexAppServerSession:
         `turn/completed`, fast-fail and mark the session for retirement.
         Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
+
+        first_output_timeout: time-to-first-output (TTFB) watchdog. A codex
+        subprocess can accept `turn/start` and then emit NOTHING (no
+        notifications at all) for the entire turn — a wedged/admission-stalled
+        backend that the outer turn deadline (600s by default) would let burn
+        the full limit, which also happens to equal the cron inactivity
+        timeout, so cron's own watchdog kills the run at `initializing` with
+        no agent-side backstop. If no notification arrives within this many
+        seconds of `turn/start`, fast-fail and retire the session so the
+        caller respawns codex (a fresh connection typically succeeds in
+        seconds). Mirrors the `_codex_stream_last_event_ts` / "no first byte"
+        watchdog in the `codex_responses` stream path. Defaults to the
+        HERMES_CODEX_TTFB_TIMEOUT_SECONDS env var (120.0s; 0 disables).
         """
+        # Resolve the TTFB window: explicit arg wins, else env knob, else the
+        # stream-path default (120s). 0 disables the watchdog.
+        ttfb_timeout = first_output_timeout
+        if ttfb_timeout is None:
+            _raw = os.environ.get("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "120.0")
+            try:
+                ttfb_timeout = float(_raw)
+            except ValueError:
+                ttfb_timeout = 120.0
+        ttfb_enabled = ttfb_timeout > 0
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
         # the same way per-turn failures do — with a TurnResult.error string
@@ -560,12 +598,29 @@ class CodexAppServerSession:
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
         deadline = time.monotonic() + turn_timeout
+        # TTFB watchdog state. turn_started_at anchors the window: if no
+        # notification at all has arrived by turn_started_at + ttfb_timeout,
+        # the subprocess accepted turn/start but is not responding — fast-fail
+        # instead of burning the whole turn deadline.
+        turn_started_at = time.monotonic()
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
+        # In-progress tool execution state. Set when codex emits item/started
+        # for a tool item and cleared on that tool's item/completed. While a
+        # tool is running, codex emits no further notifications until it
+        # completes, so the post-tool quiet watchdog must NOT fire — the outer
+        # turn deadline bounds the tool's runtime instead. Without this guard,
+        # a legitimately-long tool (>90s, e.g. a multi-step browser publish)
+        # trips the post-tool watchdog mid-execution and retires the session.
+        tool_in_progress: Optional[str] = None
+        # First-output state: becomes True as soon as ANY notification or
+        # server request arrives for this turn. The TTFB watchdog only fires
+        # while this is still False (codex emitted nothing at all).
+        got_first_output = False
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -593,8 +648,14 @@ class CodexAppServerSession:
             # Post-tool watchdog: if a tool completion was the most recent
             # signal and codex has been silent past the quiet timeout, give
             # up on this turn instead of waiting for the outer deadline.
+            # Guard: never fire while a tool is still executing. Codex emits
+            # no notifications during a tool's run, so a long-but-legitimate
+            # tool would otherwise be mistaken for silence and retired
+            # mid-side-effect (e.g. a multi-minute browser publish). The
+            # outer turn deadline bounds an in-progress tool instead.
             if (
-                last_tool_completion_at is not None
+                tool_in_progress is None
+                and last_tool_completion_at is not None
                 and (time.monotonic() - last_tool_completion_at)
                     > post_tool_quiet_timeout
             ):
@@ -608,10 +669,34 @@ class CodexAppServerSession:
                 result.should_retire = True
                 break
 
+            # TTFB watchdog: codex accepted turn/start but has produced NO
+            # output at all (no notification, no server request). Fast-fail
+            # and retire so the caller respawns codex instead of letting the
+            # outer turn deadline (== cron inactivity limit) burn the whole
+            # run at `initializing`. Mirrors the `codex_responses` stream
+            # path's "no first byte" watchdog.
+            if (
+                ttfb_enabled
+                and not got_first_output
+                and (time.monotonic() - turn_started_at) > ttfb_timeout
+            ):
+                self._issue_interrupt(result.turn_id)
+                result.interrupted = True
+                result.error = self._format_error_with_stderr(
+                    f"codex emitted no output within "
+                    f"{ttfb_timeout:.0f}s of turn/start "
+                    f"(no first byte); retiring app-server session."
+                )
+                result.should_retire = True
+                break
+
             # Drain any server-initiated requests (approvals) before
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                # A server-initiated request (approval, MCP elicitation) is
+                # live output from codex — first byte arrived.
+                got_first_output = True
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -631,6 +716,7 @@ class CodexAppServerSession:
                             pending.get("method"),
                         )
                         continue
+                    got_first_output = True
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -685,6 +771,9 @@ class CodexAppServerSession:
                     "ignoring foreign codex notification: method=%s", method
                 )
                 continue
+            # First valid notification for this turn = codex is alive and
+            # producing output. Disarm the TTFB watchdog.
+            got_first_output = True
 
             if self._on_event is not None:
                 try:
@@ -700,6 +789,27 @@ class CodexAppServerSession:
             # approval (the approval params themselves don't carry the
             # changeset). Quirk #4 fix.
             self._track_pending_file_change(note)
+
+            # Track tool execution state (started vs completed) so the
+            # post-tool quiet watchdog can tell "codex is running a tool"
+            # from "codex finished a tool and went silent". Codex emits
+            # item/started when it begins a tool and emits nothing further
+            # until that tool's item/completed — so while a tool is in
+            # flight, silence is expected and must not trip the watchdog.
+            item = (note.get("params") or {}).get("item") or {}
+            if method == "item/started" and _is_tool_item(item):
+                tool_in_progress = item.get("id") or None
+                # A freshly-started tool means codex is alive and busy; clear
+                # any stale quiet-timer anchor from a prior completed tool.
+                last_tool_completion_at = None
+            elif method == "item/completed" and _is_tool_item(item):
+                # Tool finished — clear in-progress. The completion anchor
+                # (last_tool_completion_at) is armed by the projector's
+                # is_tool_iteration branch immediately below; do NOT set it
+                # here as well or we'd double-tick the monotonic clock and
+                # shift the watchdog's timing semantics.
+                if tool_in_progress is not None:
+                    tool_in_progress = None
 
             # Project into messages
             projection = projector.project(note)
