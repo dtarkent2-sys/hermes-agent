@@ -4672,6 +4672,28 @@ class TestDesktopCronTicker:
         with self._client():
             assert called.wait(3.0), "expected cron tick under HERMES_DESKTOP=1"
 
+    def test_ticker_skipped_when_gateway_present(self, monkeypatch, _isolate_hermes_home):
+        """The desktop backend must NOT spawn a second cron ticker when a real
+        gateway already owns this HERMES_HOME's schedule — a redundant ticker
+        races every due job, doubling a 1m-interval job's cadence to ~120s and
+        intermittently skipping ticks outright (the slot-drop symptom)."""
+        import threading
+        import cron.scheduler as sched
+        import hermes_cli.gateway as gw_mod
+
+        called = threading.Event()
+        monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(
+            gw_mod, "find_gateway_pids", lambda *a, **k: [12345]
+        )
+
+        # Give the (skipped) ticker enough time to fire if it wrongly started.
+        with self._client():
+            assert not called.wait(1.5), (
+                "desktop cron ticker should not run when a gateway owns the schedule"
+            )
+
 
 class TestServeIndexMissingIndex:
     """_serve_index must not raise per-request when index.html vanishes

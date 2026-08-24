@@ -405,14 +405,41 @@ async def _lifespan(app: "FastAPI"):
         except Exception:
             _log.exception("Desktop startup: orphan gateway reap failed")
 
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+        # A real gateway (hermes gateway run) already owns this HERMES_HOME's
+        # cron schedule — it ticks the same jobs on its own loop. Spawning a
+        # second in-process ticker here would make TWO processes race every
+        # due job: they fight over `next_run_at` / `fire_claim` / the tick
+        # lock, so a 1m-interval job's effective cadence doubles (~120s) and
+        # ticks intermittently get skipped outright (the slot-drop symptom).
+        # Only start the desktop ticker when NO gateway is present — exactly
+        # the "app has no gateway running the scheduler" assumption this block
+        # already states but never enforced. Fail-safe: if we cannot determine
+        # gateway state, start the desktop ticker (preserves at-least-some
+        # firing rather than risking no jobs at all).
+        desktop_ticker_needed = True
+        try:
+            from hermes_cli.gateway import find_gateway_pids
+
+            _gateway_pids = find_gateway_pids()
+            if _gateway_pids:
+                _log.info(
+                    "Desktop cron ticker skipped: gateway(s) %s already own the "
+                    "cron schedule for this profile",
+                    _gateway_pids,
+                )
+                desktop_ticker_needed = False
+        except Exception:
+            _log.exception("Desktop startup: gateway-pid check failed; starting cron ticker")
+
+        if desktop_ticker_needed:
+            cron_stop = threading.Event()
+            cron_thread = threading.Thread(
+                target=_start_desktop_cron_ticker,
+                args=(cron_stop,),
+                daemon=True,
+                name="desktop-cron-ticker",
+            )
+            cron_thread.start()
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
