@@ -322,6 +322,63 @@ class TestSpawnEnvIsolation:
         assert "\\" not in override
         assert "sandbox_workspace_write.network_access=false" in cmd
 
+    def test_kanban_writable_root_config_load_guard_fails_loudly(self, monkeypatch):
+        """A writable_roots override that would make codex reject the config
+        must fail loudly at config-build time (before spawn) instead of
+        surfacing as a silent initialize timeout. The guard re-parses the
+        built TOML override and asserts it yields a real list."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DB",
+            "C:\\\\Users\\\\dtark\\\\AppData\\\\Local\\\\hermes\\\\kanban\\\\boards\\\\sq-autonomy\\\\kanban.db",
+        )
+
+        # Guard must not fire on a well-formed path: spawn proceeds.
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+        assert captured["cmd"][:2] == ["codex", "app-server"]
+
+        # A malformed override (a path char that breaks the TOML string — e.g.
+        # an embedded double quote) must raise a loud RuntimeError BEFORE any
+        # subprocess is spawned, instead of timing out silently on initialize.
+        captured.pop("cmd", None)
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DB",
+            'C:/x/k"anban/kanban.db',
+        )
+        with pytest.raises(RuntimeError, match="config-build"):
+            cas.CodexAppServerClient(codex_bin="codex")
+        # Guard fired before Popen: no subprocess was launched.
+        assert "cmd" not in captured
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(

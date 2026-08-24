@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import tomllib
+
 from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
@@ -119,12 +121,37 @@ class CodexAppServerClient:
             # start. POSIX paths don't hit this. Codex accepts forward slashes
             # on Windows too.
             kanban_root = kanban_root.replace("\\", "/")
+            writable_roots_override = f'sandbox_workspace_write.writable_roots=["{kanban_root}"]'
+            # Config-load guard: validate the override at build time, before we
+            # spawn codex, so a malformed value fails loudly with a precise
+            # error instead of codex silently rejecting the config and leaving
+            # the initialize handshake to hang until the 10s timeout. A broken
+            # writable_roots here previously surfaced only as a generic
+            # "codex app-server startup failed ... timed out" and the AFA cron
+            # aborted with no actionable signal.
+            try:
+                parsed = tomllib.loads(writable_roots_override)
+                roots = parsed.get("sandbox_workspace_write", {}).get(
+                    "writable_roots"
+                )
+            except (tomllib.TOMLDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "codex app-server config-build: malformed writable_roots "
+                    f"override {writable_roots_override!r} — {exc}"
+                ) from exc
+            if not isinstance(roots, list):
+                raise RuntimeError(
+                    "codex app-server config-build: writable_roots must be a "
+                    f"list, got {type(roots).__name__} ({writable_roots_override!r}). "
+                    "Fix HERMES_KANBAN_DB so it yields a clean forward-slash "
+                    "path; the codex sandbox cannot be granted a writable root."
+                )
             app_server_args.extend(
                 [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
+                    writable_roots_override,
                     "-c",
                     "sandbox_workspace_write.network_access=false",
                 ]
