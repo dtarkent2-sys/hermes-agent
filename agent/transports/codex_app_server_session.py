@@ -48,6 +48,29 @@ logger = logging.getLogger(__name__)
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
 
+# Startup handshake timeouts for the codex app-server subprocess. A *cold*
+# spawn of codex (first turn after the gateway starts, or after the previous
+# session was retired) is highly variable on Windows — measured 13.2s for a
+# full spawn+initialize+thread/start under load, occasionally worse. The
+# original hardcoded `initialize`=10s and `thread/start`=15s were too tight and
+# aborted the whole cron run on a single slow cold-start with no retry.
+# Configurable via env so operators can tune without code changes (mirrors the
+# HERMES_CODEX_TTFB_TIMEOUT_SECONDS watchdog knob). A value <= 0 falls back to
+# the default (60s) — a 0/non-blocking handshake is never desirable on startup.
+_DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS = 60.0
+_DEFAULT_CODEX_STARTUP_RETRIES = 1
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse an env var as float, falling back to `default` on garbage."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
 
 # Permission profile mapping mirrors the docstring in PR proposal:
 # Hermes' tools.terminal.security_mode → Codex's permissions profile id.
@@ -348,35 +371,90 @@ class CodexAppServerSession:
     def ensure_started(self) -> str:
         """Spawn the subprocess, do the initialize handshake, and start a
         thread. Returns the codex thread id. Idempotent — repeated calls
-        return the same thread id."""
+        return the same thread id.
+
+        A cold spawn of the codex app-server subprocess is highly variable on
+        Windows (measured 13.2s for spawn+initialize+thread/start under load,
+        occasionally worse). The startup handshake therefore uses a generous,
+        env-configurable timeout (HERMES_CODEX_STARTUP_TIMEOUT_SECONDS, default
+        60s) and retries a bounded number of times (HERMES_CODEX_STARTUP_RETRIES,
+        default 1) on a timeout before giving up. Without this, a single slow
+        cold-start on a cron/gateway run aborted the whole run at the handshake
+        with no recovery. Mirrors the TTFB watchdog knob. A timeout value <= 0
+        falls back to the default (60s) — a 0/non-blocking handshake is never
+        desirable on the startup path.
+        """
         if self._thread_id is not None:
             return self._thread_id
+        startup_timeout = _env_float(
+            "HERMES_CODEX_STARTUP_TIMEOUT_SECONDS",
+            _DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS,
+        )
+        if startup_timeout <= 0:
+            startup_timeout = _DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS
+        retries = _env_float(
+            "HERMES_CODEX_STARTUP_RETRIES",
+            float(_DEFAULT_CODEX_STARTUP_RETRIES),
+        )
+        max_attempts = max(1, int(retries) + 1)
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                # Retry path — tear down the previous, likely-unhealthy
+                # subprocess so the next attempt spawns cleanly.
+                self._teardown_client()
+            try:
+                self._start_once(startup_timeout=startup_timeout)
+                return self._thread_id
+            except TimeoutError as exc:
+                # A handshake timeout on a cold spawn is often transient load;
+                # retry up to max_attempts before giving up.
+                last_exc = exc
+                if attempt + 1 < max_attempts:
+                    logger.warning(
+                        "codex app-server startup handshake timed out on "
+                        "attempt %d/%d (timeout=%.1fs); retrying",
+                        attempt + 1,
+                        max_attempts,
+                        startup_timeout,
+                    )
+        assert last_exc is not None
+        raise last_exc
+
+    def _start_once(self, *, startup_timeout: float) -> None:
+        """One spawn + initialize + thread/start attempt. On success sets
+        self._thread_id; on failure tears down the client and re-raises."""
         if self._client is None:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home
             )
-        self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
-            client_version=_get_hermes_version(),
-        )
-        # Permission selection is intentionally NOT sent on thread/start.
-        # Two reasons (live-tested against codex 0.130.0):
-        #   1. `thread/start.permissions` is gated behind the experimentalApi
-        #      capability on this codex version — we'd have to opt in during
-        #      initialize and accept the unstable surface.
-        #   2. Even with experimentalApi declared and the correct shape
-        #      (`{"type": "profile", "id": "..."}`, not `{"profileId": ...}`),
-        #      codex requires a matching `[permissions]` table in
-        #      ~/.codex/config.toml or it fails the request with
-        #      'default_permissions requires a [permissions] table'.
-        # Letting codex pick its default (`:read-only` unless the user has
-        # configured otherwise in their codex config.toml) is the standard
-        # codex CLI workflow and avoids fighting codex's own validation.
-        # Users who want a write-capable profile configure it in their
-        # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        try:
+            self._client.initialize(
+                client_name="hermes",
+                client_title="Hermes Agent",
+                client_version=_get_hermes_version(),
+                timeout=startup_timeout,
+            )
+            # Permission selection is intentionally NOT sent on thread/start.
+            # Two reasons (live-tested against codex 0.130.0):
+            #   1. `thread/start.permissions` is gated behind the experimentalApi
+            #      capability on this codex version — we'd have to opt in during
+            #      initialize and accept the unstable surface.
+            #   2. Even with experimentalApi declared and the correct shape
+            #      (`{"type": "profile", "id": "..."}`, not `{"profileId": ...}`),
+            #      codex requires a matching `[permissions]` table in
+            #      ~/.codex/config.toml or it fails the request with
+            #      'default_permissions requires a [permissions] table'.
+            # Letting codex pick its default (`:read-only` unless the user has
+            # configured otherwise in their codex config.toml) is the standard
+            # codex CLI workflow and avoids fighting codex's own validation.
+            params: dict[str, Any] = {"cwd": self._cwd}
+            result = self._client.request(
+                "thread/start", params, timeout=startup_timeout
+            )
+        except Exception:
+            self._teardown_client()
+            raise
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -403,7 +481,22 @@ class CodexAppServerSession:
             self._permission_profile,
             self._cwd,
         )
-        return self._thread_id
+        return
+
+    def _teardown_client(self) -> None:
+        """Best-effort tear down of the current codex client so a subsequent
+        startup attempt spawns a fresh subprocess. Used on the startup-handshake
+        retry path. Does not mark the session permanently closed."""
+        with self._active_turn_lock:
+            self._active_turn_id = None
+        client = self._client
+        self._client = None
+        self._thread_id = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
 
     def close(self) -> None:
         if self._closed:

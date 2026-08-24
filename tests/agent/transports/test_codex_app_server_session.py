@@ -1138,3 +1138,108 @@ class TestFirstOutputWatchdog:
         assert r.should_retire is True
 
 
+# ---- startup handshake timeout + retry ----
+
+class TestStartupHandshake:
+    def _factory(self, handlers):
+        """Return a client_factory that hands out a fresh FakeClient per spawn,
+        with the i-th client's request() routed through handlers[i] when set.
+        Tracks which client actually answered thread/start."""
+        created = []
+        answered = []
+
+        def factory(**kw):
+            client = FakeClient(**kw)
+            idx = len(created)
+            created.append(client)
+            h = handlers[idx] if idx < len(handlers) else None
+            if h is not None:
+                client._request_handler = h
+            client._answered_by = lambda: answered.append(idx)
+            return client
+
+        return factory, created, answered
+
+    def test_retries_on_thread_start_timeout_and_succeeds(self, monkeypatch):
+        """A cold-start thread/start timeout must not abort the run: the
+        session tears down the wedged client and spawns a fresh one."""
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_TIMEOUT_SECONDS", "0.05")
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_RETRIES", "1")  # 2 attempts
+
+        calls = {"n": 0}
+
+        def first(method, params):
+            if method == "thread/start":
+                calls["n"] += 1
+                raise TimeoutError("codex app-server method 'thread/start' timed out")
+            return {"thread": {"id": "t"}}
+
+        factory, created, answered = self._factory([first])
+        s = CodexAppServerSession(cwd="/tmp", client_factory=factory)
+        tid = s.ensure_started()
+        assert tid == "thread-fake-001"  # second client's default handler
+        # Two clients were created (first wedged, second succeeded).
+        assert len(created) == 2
+        # The first client was torn down (closed) on the retry path.
+        assert created[0]._closed is True
+        # thread/start was attempted once on the first (wedged) client.
+        ts_on_first = [m for (m, _) in created[0].requests if m == "thread/start"]
+        assert len(ts_on_first) == 1
+
+    def test_gives_up_after_retries_exhausted(self, monkeypatch):
+        """If every attempt times out, ensure_started re-raises the last
+        TimeoutError instead of hanging or returning a half-started session."""
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_TIMEOUT_SECONDS", "0.05")
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_RETRIES", "1")  # 2 attempts
+
+        def always_timeout(method, params):
+            raise TimeoutError("codex app-server method 'thread/start' timed out")
+
+        factory, created, answered = self._factory([always_timeout, always_timeout])
+        s = CodexAppServerSession(cwd="/tmp", client_factory=factory)
+        with pytest.raises(TimeoutError):
+            s.ensure_started()
+        assert len(created) == 2
+        assert s._client is None  # torn down, nothing left half-started
+        assert s._thread_id is None
+
+    def test_startup_timeout_passed_to_initialize_and_thread_start(self, monkeypatch):
+        """The configured startup timeout must flow into BOTH the initialize
+        handshake and thread/start (previously thread/start was hardcoded 15s)."""
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_TIMEOUT_SECONDS", "7.5")
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_RETRIES", "0")
+
+        seen = {}
+
+        def capture(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "t"}}
+            return {}
+
+        client = FakeClient()
+        orig_request = client.request
+        orig_initialize = client.initialize
+
+        def wrap(method, params=None, timeout=30.0):
+            seen[method] = timeout
+            return orig_request(method, params, timeout)
+
+        def wrap_init(**kwargs):
+            seen["initialize"] = kwargs.get("timeout")
+            return orig_initialize(**kwargs)
+
+        client.request = wrap  # type: ignore[assignment]
+        client.initialize = wrap_init  # type: ignore[assignment]
+        client._request_handler = capture
+        s = make_session(client)
+        s.ensure_started()
+        assert seen["initialize"] == 7.5
+        assert seen["thread/start"] == 7.5
+
+    def test_defaults_allow_slow_cold_start(self):
+        """The default startup timeout (60s) is far above the hardcoded 15s
+        that aborted cron runs, and defaults to one retry."""
+        assert session_mod._DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS >= 60.0
+        assert session_mod._DEFAULT_CODEX_STARTUP_RETRIES == 1
+
+
