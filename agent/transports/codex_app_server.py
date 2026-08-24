@@ -112,6 +112,13 @@ class CodexAppServerClient:
                     ),
                 )
             )
+            # Normalize to forward slashes: this value is injected into a TOML
+            # `-c` override, and a raw Windows path (C:\Users\...) makes TOML
+            # treat the backslashes as escape sequences (\U, \A, \k), so codex
+            # parses the value as a string instead of a sequence and refuses to
+            # start. POSIX paths don't hit this. Codex accepts forward slashes
+            # on Windows too.
+            kanban_root = kanban_root.replace("\\", "/")
             app_server_args.extend(
                 [
                     "-c",

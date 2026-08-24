@@ -264,6 +264,64 @@ class TestSpawnEnvIsolation:
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
 
+    def test_kanban_writable_root_windows_path_is_toml_escaped(self, monkeypatch):
+        """A Windows Kanban root (C:\\Users\\...) must be normalized to forward
+        slashes before being injected into the TOML `-c` override. Otherwise
+        TOML treats the backslashes as escape sequences (\\U, \\A, \\k), parses
+        the value as a string rather than a sequence, and codex refuses to
+        start: 'invalid type: string "...", expected a sequence in
+        sandbox_workspace_write.writable_roots'."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DB",
+            "C:\\Users\\dtark\\AppData\\Local\\hermes\\kanban\\boards\\sq-autonomy\\kanban.db",
+        )
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        cmd = captured["cmd"]
+        assert cmd[:2] == ["codex", "app-server"]
+        assert (
+            'sandbox_workspace_write.writable_roots=['
+            '"C:/Users/dtark/AppData/Local/hermes/kanban/boards/sq-autonomy"]'
+            in cmd
+        )
+        # No backslashes must leak into the TOML override.
+        override = next(
+            part for part in cmd if part.startswith("sandbox_workspace_write.writable_roots")
+        )
+        assert "\\" not in override
+        assert "sandbox_workspace_write.network_access=false" in cmd
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
