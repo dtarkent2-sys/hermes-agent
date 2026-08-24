@@ -106,6 +106,25 @@ def _is_tool_item(item: dict) -> bool:
     return bool(item) and (item.get("type") in _TOOL_ITEM_TYPES)
 
 
+def _notification_disarms_ttfb(note: dict) -> bool:
+    """Return whether a notification proves substantive turn progress.
+
+    Lifecycle acknowledgements such as ``turn/started`` only prove that Codex
+    accepted the request. A wedged backend can emit that acknowledgement and
+    then remain silent for the rest of the turn. Treating it as a first byte
+    disarms the TTFB watchdog and lets the turn burn the full outer deadline.
+
+    Item notifications and their deltas represent actual reasoning, assistant
+    output, or tool activity, so they do disarm the watchdog. Terminal turn
+    notifications also count, although the main loop exits immediately after
+    processing them.
+    """
+    if not isinstance(note, dict):
+        return False
+    method = str(note.get("method") or "")
+    return method.startswith("item/") or method == "turn/completed"
+
+
 def _notification_scope_ids(
     note: dict,
 ) -> tuple[Optional[str], Optional[str]]:
@@ -506,10 +525,10 @@ class CodexAppServerSession:
         backend that the outer turn deadline (600s by default) would let burn
         the full limit, which also happens to equal the cron inactivity
         timeout, so cron's own watchdog kills the run at `initializing` with
-        no agent-side backstop. If no notification arrives within this many
-        seconds of `turn/start`, fast-fail and retire the session so the
-        caller respawns codex (a fresh connection typically succeeds in
-        seconds). Mirrors the `_codex_stream_last_event_ts` / "no first byte"
+        no agent-side backstop. If no substantive turn activity (item output,
+        tool activity, or completion) arrives within this many seconds of
+        `turn/start`, fast-fail and retire the session. Lifecycle-only
+        acknowledgements such as `turn/started` do not disarm the guard.
         watchdog in the `codex_responses` stream path. Defaults to the
         HERMES_CODEX_TTFB_TIMEOUT_SECONDS env var (120.0s; 0 disables).
         """
@@ -617,9 +636,11 @@ class CodexAppServerSession:
         # a legitimately-long tool (>90s, e.g. a multi-step browser publish)
         # trips the post-tool watchdog mid-execution and retires the session.
         tool_in_progress: Optional[str] = None
-        # First-output state: becomes True as soon as ANY notification or
-        # server request arrives for this turn. The TTFB watchdog only fires
-        # while this is still False (codex emitted nothing at all).
+        # First-output state: becomes True only after substantive progress for
+        # this turn (an item event/delta or turn completion). A bare lifecycle
+        # acknowledgement such as turn/started is intentionally insufficient:
+        # Codex can emit it and then wedge forever, which previously disarmed
+        # this guard and let cron's 600s inactivity watchdog win the race.
         got_first_output = False
 
         while time.monotonic() < deadline and not turn_complete:
@@ -716,7 +737,8 @@ class CodexAppServerSession:
                             pending.get("method"),
                         )
                         continue
-                    got_first_output = True
+                    if _notification_disarms_ttfb(pending):
+                        got_first_output = True
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -771,9 +793,11 @@ class CodexAppServerSession:
                     "ignoring foreign codex notification: method=%s", method
                 )
                 continue
-            # First valid notification for this turn = codex is alive and
-            # producing output. Disarm the TTFB watchdog.
-            got_first_output = True
+            # Only substantive activity for this turn disarms TTFB. A bare
+            # turn/started acknowledgement can be emitted immediately before
+            # the backend wedges and must leave the watchdog armed.
+            if _notification_disarms_ttfb(note):
+                got_first_output = True
 
             if self._on_event is not None:
                 try:

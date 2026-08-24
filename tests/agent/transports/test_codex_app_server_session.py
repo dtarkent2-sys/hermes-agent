@@ -1041,12 +1041,33 @@ class TestFirstOutputWatchdog:
         # interrupt was issued to stop wasted compute
         assert any(method == "turn/interrupt" for method, _ in client.requests)
 
-    def test_first_notification_disarms_watchdog(self):
-        """Once codex emits ANY notification, the TTFB watchdog must not
-        fire even if it later goes quiet (that's the post-tool watchdog's
-        job) — the turn should run to normal completion."""
+    def test_lifecycle_acknowledgement_does_not_disarm_watchdog(self):
+        """The noisy-start regression: turn/started is only an acknowledgement,
+        not substantive model output. If Codex wedges immediately afterward,
+        TTFB must remain armed and retire the session before the outer deadline.
+        """
         client = FakeClient()
-        # First output arrives immediately, then turn completes normally.
+        client.queue_notification(
+            "turn/started", threadId="t", turn={"id": "tu1"}
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "ack then silence",
+            turn_timeout=600.0,
+            notification_poll_timeout=0.0,
+            first_output_timeout=0.02,
+        )
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "no first byte" in r.error
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_substantive_notification_disarms_watchdog(self):
+        """An item event is substantive progress and disarms TTFB; the turn
+        can then continue through normal completion."""
+        client = FakeClient()
+        # Lifecycle acknowledgement alone is insufficient. The completed
+        # agentMessage below is the event that disarms TTFB.
         client.queue_notification(
             "turn/started", threadId="t", turn={"id": "tu1"}
         )
