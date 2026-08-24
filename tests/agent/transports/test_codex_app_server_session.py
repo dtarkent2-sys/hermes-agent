@@ -19,6 +19,10 @@ from agent.transports.codex_app_server_session import (
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
     _coerce_turn_input_text,
+    _resolve_startup_retries,
+    _resolve_startup_timeout,
+    _MAX_CODEX_STARTUP_RETRIES,
+    _DEFAULT_CODEX_STARTUP_RETRIES,
 )
 
 
@@ -1241,5 +1245,220 @@ class TestStartupHandshake:
         that aborted cron runs, and defaults to one retry."""
         assert session_mod._DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS >= 60.0
         assert session_mod._DEFAULT_CODEX_STARTUP_RETRIES == 1
+
+    @pytest.mark.parametrize(
+        "env_value,expected",
+        [
+            # huge → clamped to hard cap (no effectively-unbounded retries)
+            ("1000000", _MAX_CODEX_STARTUP_RETRIES),
+            # inf / nan → fall back to default (no int() crash)
+            ("inf", _DEFAULT_CODEX_STARTUP_RETRIES),
+            ("-inf", _DEFAULT_CODEX_STARTUP_RETRIES),
+            ("nan", _DEFAULT_CODEX_STARTUP_RETRIES),
+            # negative → fall back to default
+            ("-1", _DEFAULT_CODEX_STARTUP_RETRIES),
+            ("--5", _DEFAULT_CODEX_STARTUP_RETRIES),
+            # fractional → truncated (int floor)
+            ("2.7", 2),
+            ("0.5", 0),
+            # boundary: exactly the cap stays the cap
+            (str(_MAX_CODEX_STARTUP_RETRIES), _MAX_CODEX_STARTUP_RETRIES),
+            # above the cap → clamped
+            (str(_MAX_CODEX_STARTUP_RETRIES + 1), _MAX_CODEX_STARTUP_RETRIES),
+        ],
+    )
+    def test_resolve_retries_huge_inf_nan_negative_fractional(
+        self, env_value, expected
+    ):
+        """The review's required boundary cases: huge, inf, nan, negative, and
+        fractional inputs must all resolve to a bounded int in
+        [0, _MAX_CODEX_STARTUP_RETRIES] without raising."""
+        assert _resolve_startup_retries(env_value, None, _DEFAULT_CODEX_STARTUP_RETRIES) == expected
+
+    def test_resolve_retries_clamped_from_config_too(self):
+        """The hard cap must apply to config-derived values as well as env."""
+        # A giant config value is clamped identically to the env path.
+        assert _resolve_startup_retries(
+            None, 10_000_000, _DEFAULT_CODEX_STARTUP_RETRIES
+        ) == _MAX_CODEX_STARTUP_RETRIES
+        # Non-finite config value falls back to default.
+        assert _resolve_startup_retries(
+            None, float("inf"), _DEFAULT_CODEX_STARTUP_RETRIES
+        ) == _DEFAULT_CODEX_STARTUP_RETRIES
+
+    def test_resolve_retries_always_returns_int(self):
+        """The retry count must ALWAYS be an int (not a float) so that
+        ``range(max(1, retries + 1))`` in ensure_started() never raises
+        TypeError. This pins the negative-fallback path, which previously
+        returned ``float(default)``."""
+        for env_value in ("-1", "-3", "0", "2.7", "1000000", "inf", "nan", "1"):
+            result = _resolve_startup_retries(env_value, None, _DEFAULT_CODEX_STARTUP_RETRIES)
+            assert isinstance(result, int), (
+                f"retry count for env {env_value!r} is {type(result).__name__}, not int"
+            )
+        # config path too
+        for cfg_value in (-1, 2.7, 10_000_000, float("inf"), 0):
+            result = _resolve_startup_retries(None, cfg_value, _DEFAULT_CODEX_STARTUP_RETRIES)
+            assert isinstance(result, int), (
+                f"retry count for config {cfg_value!r} is {type(result).__name__}, not int"
+            )
+
+    def test_env_bridge_overrides_config(self, monkeypatch):
+        """Config is the operator control, but the internal env bridge still
+        takes precedence for a single process."""
+        # Simulate a config value, then set the env bridge; env must win.
+        assert _resolve_startup_retries("3", 1, _DEFAULT_CODEX_STARTUP_RETRIES) == 3
+        assert _resolve_startup_retries(None, 2, _DEFAULT_CODEX_STARTUP_RETRIES) == 2
+
+    @pytest.mark.parametrize(
+        "env_value,config_value,expected",
+        [
+            # default when nothing set
+            (None, None, 60.0),
+            # env finite positive
+            ("90", None, 90.0),
+            # env fractional
+            ("2.5", None, 2.5),
+            # config positive
+            (None, 45.0, 45.0),
+            # env overrides config
+            ("30", 45.0, 30.0),
+            # env non-finite → default even with config set (env wins, but is invalid)
+            ("nan", 45.0, 60.0),
+            # env <= 0 → default
+            ("0", None, 60.0),
+            ("-4", None, 60.0),
+            # config <= 0 → default
+            (None, 0, 60.0),
+            # config non-finite → default
+            (None, float("nan"), 60.0),
+            # garbage string → default
+            ("not-a-number", None, 60.0),
+        ],
+    )
+    def test_resolve_timeout_validation(self, env_value, config_value, expected):
+        assert _resolve_startup_timeout(env_value, config_value, 60.0) == expected
+
+    def test_ensure_started_uses_resolved_retry_count(self, monkeypatch):
+        """End-to-end: ensure_started must honor the clamped retry count. With
+        retries clamped to 0 (from a huge env value that the resolver floors)
+        and a handler that always times out, only ONE client is created —
+        proving the bound is real, not just cosmetic."""
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_TIMEOUT_SECONDS", "0.05")
+        # 0.5 fractional → int(0.5) == 0 retries → 1 attempt
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_RETRIES", "0.5")
+
+        def always_timeout(method, params):
+            raise TimeoutError("codex app-server method 'thread/start' timed out")
+
+        created = []
+
+        def factory(**kw):
+            client = FakeClient(**kw)
+            created.append(client)
+            client._request_handler = always_timeout
+            return client
+
+        s = CodexAppServerSession(cwd="/tmp", client_factory=factory)
+        with pytest.raises(TimeoutError):
+            s.ensure_started()
+        # Exactly one attempt (0 retries) — a huge/uncapped value would create
+        # many more clients.
+        assert len(created) == 1
+        assert s._client is None
+        assert s._thread_id is None
+
+    def test_ensure_started_clamps_huge_retry_count(self, monkeypatch):
+        """A huge HERMES_CODEX_STARTUP_RETRIES (e.g. 1_000_000) must be clamped
+        to the hard cap, so the number of attempts is bounded rather than
+        effectively unbounded."""
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_TIMEOUT_SECONDS", "0.05")
+        monkeypatch.setenv("HERMES_CODEX_STARTUP_RETRIES", "1000000")
+
+        def always_timeout(method, params):
+            raise TimeoutError("codex app-server method 'thread/start' timed out")
+
+        created = []
+
+        def factory(**kw):
+            client = FakeClient(**kw)
+            created.append(client)
+            client._request_handler = always_timeout
+            return client
+
+        s = CodexAppServerSession(cwd="/tmp", client_factory=factory)
+        with pytest.raises(TimeoutError):
+            s.ensure_started()
+        # Bounded: 1 (initial) + _MAX_CODEX_STARTUP_RETRIES retries.
+        assert len(created) == 1 + _MAX_CODEX_STARTUP_RETRIES
+        assert s._client is None
+        assert s._thread_id is None
+
+
+class TestCodexStartupConfigPropagation:
+    """config.yaml is the operator-facing control (repository AGENTS.md policy);
+    the HERMES_* env vars are an internal bridge only. These tests prove the
+    resolver path reads the codex config section when the env bridge is unset."""
+
+    def test_config_section_is_documented_in_defaults(self):
+        """The codex startup knobs ship in DEFAULT_CONFIG so config.yaml-backed
+        values are recognized (not treated as unknown roots)."""
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert "codex" in DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["codex"]["startup_timeout_seconds"] == 60.0
+        assert DEFAULT_CONFIG["codex"]["startup_retries"] == 1
+
+    def test_codex_config_section_reads_config(self, monkeypatch):
+        """_codex_config_section returns the codex section from a loaded config."""
+        fake_cfg = {
+            "codex": {"startup_timeout_seconds": 90, "startup_retries": 2},
+        }
+        monkeypatch.setattr(
+            session_mod, "_codex_config_section", lambda: dict(fake_cfg["codex"])
+        )
+        assert session_mod._codex_config_section() == {
+            "startup_timeout_seconds": 90,
+            "startup_retries": 2,
+        }
+
+    def test_ensure_started_honors_config_when_env_unset(
+        self, monkeypatch, tmp_path
+    ):
+        """With the env bridge unset, ensure_started must pick up the retry
+        count from config.yaml (the operator-facing control). A config retry
+        count of 2 (→ 3 attempts) must produce exactly 3 client spawns."""
+        # Point HERMES_HOME at a temp dir and write a codex section.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import yaml
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump(
+                {"codex": {"startup_timeout_seconds": 0.05, "startup_retries": 2}}
+            )
+        )
+        monkeypatch.delenv("HERMES_CODEX_STARTUP_TIMEOUT_SECONDS", raising=False)
+        monkeypatch.delenv("HERMES_CODEX_STARTUP_RETRIES", raising=False)
+
+        def always_timeout(method, params):
+            raise TimeoutError("codex app-server method 'thread/start' timed out")
+
+        created = []
+
+        def factory(**kw):
+            client = FakeClient(**kw)
+            created.append(client)
+            client._request_handler = always_timeout
+            return client
+
+        s = CodexAppServerSession(cwd="/tmp", client_factory=factory)
+        with pytest.raises(TimeoutError):
+            s.ensure_started()
+        # 1 initial + 2 config-derived retries = 3 attempts.
+        assert len(created) == 3
+        assert s._client is None
+        assert s._thread_id is None
+
 
 

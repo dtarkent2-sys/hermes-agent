@@ -380,6 +380,39 @@ When the model calls `web_search` (or another exposed Hermes tool), codex spawns
 
 **Tools NOT available:** `delegate_task`, `memory`, `session_search`, `todo`. These need the running AIAgent context to dispatch (mid-loop state) and a stateless MCP callback can't drive them. Use the default Hermes runtime (`/codex-runtime auto`) when you need these.
 
+## Startup-handshake retry policy (config.yaml)
+
+A cold spawn of the `codex app-server` subprocess is highly variable (measured
+13.2s for spawn+initialize+thread/start on Windows under load, occasionally
+worse). The original hardcoded handshake timeouts (10s / 15s) aborted an entire
+cron or gateway run on a single slow cold-start with no recovery. The startup
+handshake therefore uses a generous timeout and retries a **bounded** number of
+times before giving up.
+
+These are operator-facing controls in `config.yaml` under the `codex` section —
+the repository policy routes non-secret behavioral settings through `config.yaml`
+rather than new user-facing `HERMES_*` env vars. The `HERMES_CODEX_STARTUP_*`
+names are an **internal env bridge** that may override config for a single
+process; `config.yaml` is the documented control.
+
+```yaml
+codex:
+  # Per-attempt handshake timeout (seconds). Default 60. Non-positive or
+  # non-finite values fall back to 60.
+  startup_timeout_seconds: 60
+  # Additional retries after the first attempt. Default 1 (up to 2 attempts).
+  # Clamped to a hard maximum of 5; negative / non-finite values fall back to 1.
+  # Total attempts = startup_retries + 1.
+  startup_retries: 1
+```
+
+The retry count is always finite and clamped, so a misconfigured value (e.g.
+`1000000`, `inf`, or `nan`) can never produce an effectively unbounded number of
+handshake attempts — it is either clamped to the cap or falls back to the
+default. Between attempts the session tears down the previous, likely-unhealthy
+subprocess so the next attempt spawns cleanly, and the path remains fail-closed
+(raises the last `TimeoutError` once attempts are exhausted).
+
 ## Disabling
 
 Switch back at any time:

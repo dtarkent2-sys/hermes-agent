@@ -25,6 +25,7 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -54,11 +55,22 @@ _STDERR_TAIL_LINES = 12
 # full spawn+initialize+thread/start under load, occasionally worse. The
 # original hardcoded `initialize`=10s and `thread/start`=15s were too tight and
 # aborted the whole cron run on a single slow cold-start with no retry.
-# Configurable via env so operators can tune without code changes (mirrors the
-# HERMES_CODEX_TTFB_TIMEOUT_SECONDS watchdog knob). A value <= 0 falls back to
-# the default (60s) — a 0/non-blocking handshake is never desirable on startup.
+#
+# Operator-facing control lives in config.yaml under the `codex` section
+# (`codex.startup_timeout_seconds`, `codex.startup_retries`) — the repository
+# policy (AGENTS.md) routes non-secret behavioral settings through config.yaml
+# rather than new user-facing HERMES_* env vars. The HERMES_* names below are
+# an *internal* env bridge that may override config for a single process; they
+# are not the documented control. Mirrors the HERMES_CODEX_TTFB_TIMEOUT_SECONDS
+# watchdog bridge.
 _DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS = 60.0
 _DEFAULT_CODEX_STARTUP_RETRIES = 1
+# Hard cap on the retry count so a misconfigured value can never produce an
+# effectively-unbounded number of handshake attempts. Total attempts =
+# retries + 1, so this bounds a single startup to at most 6 tries.
+_MAX_CODEX_STARTUP_RETRIES = 5
+_ENV_STARTUP_TIMEOUT = "HERMES_CODEX_STARTUP_TIMEOUT_SECONDS"
+_ENV_STARTUP_RETRIES = "HERMES_CODEX_STARTUP_RETRIES"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -70,6 +82,99 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _parse_finite_float(raw: Any, default: float) -> float:
+    """Parse ``raw`` (a str/int/float from env or config) into a *finite*
+    float, returning ``default`` on any non-finite or unparseable value.
+
+    Guards the ``int()`` conversion in the retry path: ``float('inf')`` and
+    ``float('nan')`` would otherwise raise ``OverflowError``/``ValueError``
+    when coerced to ``int``. Non-finite input is treated as "use the default"
+    rather than a hard error, matching the fail-soft contract of
+    :func:`_env_float`.
+    """
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    else:
+        text = str(raw).strip()
+        if not text:
+            return default
+        try:
+            value = float(text)
+        except (ValueError, TypeError):
+            return default
+    if not math.isfinite(value):
+        return default
+    return value
+
+
+def _codex_config_section() -> dict:
+    """Return the ``codex`` section of config.yaml (empty dict on any error).
+
+    Read-only consumer — never mutates. Failures (no config, missing
+    hermes_cli, non-dict section) degrade to ``{}`` so the resolver falls
+    back to defaults rather than aborting a cold start.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+    except Exception:
+        return {}
+    try:
+        section = cfg_get(load_config_readonly(), "codex", default={})
+    except Exception:
+        return {}
+    return section if isinstance(section, dict) else {}
+
+
+def _resolve_startup_timeout(
+    raw_env: Any, config_value: Any, default: float
+) -> float:
+    """Resolve the per-attempt handshake timeout.
+
+    Precedence: env bridge > config.yaml > default. A non-finite or
+    non-positive result falls back to ``default`` (a 0/non-blocking handshake
+    is never desirable on the startup path).
+    """
+    if raw_env is not None and str(raw_env).strip():
+        value = _parse_finite_float(raw_env, default)
+    elif config_value is not None:
+        value = _parse_finite_float(config_value, default)
+    else:
+        value = default
+    if not math.isfinite(value) or value <= 0:
+        return default
+    return value
+
+
+def _resolve_startup_retries(
+    raw_env: Any, config_value: Any, default: int
+) -> int:
+    """Resolve a *bounded* retry count.
+
+    Precedence: env bridge > config.yaml > default. Validation rules:
+      * huge values      → clamped to ``_MAX_CODEX_STARTUP_RETRIES``
+      * inf / nan        → fall back to ``default`` (no ``int()`` crash)
+      * negative values  → fall back to ``default``
+      * fractional values→ truncated (``int()`` floor)
+    Result is always an int in ``[0, _MAX_CODEX_STARTUP_RETRIES]``.
+    """
+    if raw_env is not None and str(raw_env).strip():
+        value = _parse_finite_float(raw_env, float(default))
+    elif config_value is not None:
+        value = _parse_finite_float(config_value, float(default))
+    else:
+        value = float(default)
+    if value < 0:
+        value = float(default)
+    # Coerce to int *before* the cap so the result is always an int in
+    # [0, _MAX_CODEX_STARTUP_RETRIES] — range() in ensure_started() rejects
+    # floats, so a float retry count (e.g. from the negative-fallback path)
+    # would otherwise raise TypeError at startup.
+    value = min(int(value), _MAX_CODEX_STARTUP_RETRIES)
+    return value
 
 
 # Permission profile mapping mirrors the docstring in PR proposal:
@@ -375,28 +480,38 @@ class CodexAppServerSession:
 
         A cold spawn of the codex app-server subprocess is highly variable on
         Windows (measured 13.2s for spawn+initialize+thread/start under load,
-        occasionally worse). The startup handshake therefore uses a generous,
-        env-configurable timeout (HERMES_CODEX_STARTUP_TIMEOUT_SECONDS, default
-        60s) and retries a bounded number of times (HERMES_CODEX_STARTUP_RETRIES,
-        default 1) on a timeout before giving up. Without this, a single slow
-        cold-start on a cron/gateway run aborted the whole run at the handshake
-        with no recovery. Mirrors the TTFB watchdog knob. A timeout value <= 0
-        falls back to the default (60s) — a 0/non-blocking handshake is never
+        occasionally worse). The startup handshake therefore uses a generous
+        timeout (default 60s) and retries a bounded number of times (default 1)
+        on a timeout before giving up. Without this, a single slow cold-start
+        on a cron/gateway run aborted the whole run at the handshake with no
+        recovery.
+
+        The timeout and retry count are operator-controlled through config.yaml
+        under the ``codex`` section (``codex.startup_timeout_seconds`` and
+        ``codex.startup_retries``). The HERMES_* names act as an *internal* env
+        bridge that may override config for a single process; config.yaml is the
+        documented control (repository AGENTS.md policy: non-secret behavioral
+        settings live in config.yaml, not in new user-facing HERMES_* vars).
+        The retry count is validated to be finite and clamped to a small hard
+        maximum, so a misconfigured value can never produce an effectively
+        unbounded number of attempts; a timeout value <= 0 or non-finite falls
+        back to the default (60s) — a 0/non-blocking handshake is never
         desirable on the startup path.
         """
         if self._thread_id is not None:
             return self._thread_id
-        startup_timeout = _env_float(
-            "HERMES_CODEX_STARTUP_TIMEOUT_SECONDS",
+        codex_cfg = _codex_config_section()
+        startup_timeout = _resolve_startup_timeout(
+            os.environ.get(_ENV_STARTUP_TIMEOUT),
+            codex_cfg.get("startup_timeout_seconds"),
             _DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS,
         )
-        if startup_timeout <= 0:
-            startup_timeout = _DEFAULT_CODEX_STARTUP_TIMEOUT_SECONDS
-        retries = _env_float(
-            "HERMES_CODEX_STARTUP_RETRIES",
-            float(_DEFAULT_CODEX_STARTUP_RETRIES),
+        retries = _resolve_startup_retries(
+            os.environ.get(_ENV_STARTUP_RETRIES),
+            codex_cfg.get("startup_retries"),
+            _DEFAULT_CODEX_STARTUP_RETRIES,
         )
-        max_attempts = max(1, int(retries) + 1)
+        max_attempts = max(1, retries + 1)
         last_exc: Optional[Exception] = None
         for attempt in range(max_attempts):
             if attempt > 0:

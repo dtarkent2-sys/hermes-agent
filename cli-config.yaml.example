@@ -29,6 +29,23 @@ runtime:
   nofile_soft_limit: 4096
 
 # =============================================================================
+# Codex app-server runtime (codex CLI)
+# =============================================================================
+# Startup-handshake retry policy for the codex app-server (codex CLI) runtime.
+# A cold spawn of the codex subprocess is highly variable (e.g. on Windows), so
+# the handshake uses a generous timeout and a small bounded retry count before
+# giving up. These are the operator-facing controls; the HERMES_CODEX_STARTUP_*
+# env vars are an internal bridge that may override them per-process.
+codex:
+  # Per-attempt handshake timeout in seconds. Default 60. Non-positive or
+  # non-finite values fall back to 60.
+  startup_timeout_seconds: 60
+  # Additional retries after the first attempt. Default 1 (so up to 2 attempts).
+  # Clamped to a hard maximum of 5; negative / non-finite values fall back to 1.
+  # Total attempts = startup_retries + 1.
+  startup_retries: 1
+
+# =============================================================================
 # Model Configuration
 # =============================================================================
 model:

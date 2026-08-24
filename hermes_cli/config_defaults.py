@@ -28,6 +28,23 @@ DEFAULT_CONFIG = {
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
+    # Behavioral settings for the codex app-server (codex CLI) runtime. These
+    # are the operator-facing controls for the startup-handshake retry policy
+    # (see agent/transports/codex_app_server_session.py). A *cold* spawn of the
+    # codex app-server is highly variable on Windows, so the handshake uses a
+    # generous timeout and a small bounded retry count before giving up.
+    #   startup_timeout_seconds: per-attempt handshake timeout (seconds).
+    #       Non-positive or non-finite values fall back to 60.
+    #   startup_retries: additional retries after the first attempt (bounded).
+    #       Non-finite/negative values fall back to 1; values above the hard
+    #       cap (5) are clamped. Total attempts = retries + 1.
+    # An internal env bridge (HERMES_CODEX_STARTUP_TIMEOUT_SECONDS /
+    # HERMES_CODEX_STARTUP_RETRIES) may override these per-process, but config
+    # is the documented operator control.
+    "codex": {
+        "startup_timeout_seconds": 60.0,
+        "startup_retries": 1,
+    },
     # Soft LRU cap on in-memory TUI/desktop/dashboard sessions. When more than
     # this many are live, the gateway evicts the least-recently-active DETACHED
     # sessions (no live client) so accumulated agents don't pile up under memory
