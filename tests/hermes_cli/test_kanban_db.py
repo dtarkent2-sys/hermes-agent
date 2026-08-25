@@ -249,19 +249,50 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
 
 
 # ---------------------------------------------------------------------------
-# Rate-limit requeue: a worker that bails on a provider quota wall must be
-# released back to ``ready`` WITHOUT counting a failure, so a long (e.g.
-# 5-hour) quota window can't trip the circuit breaker and permanently block
-# the card. The respawn guard then defers it on a cooldown until quota
-# returns. Regression coverage for the kanban-rate-limit-failure report.
+# Rate-limit + provider-outage requeue: a worker that bails on a provider
+# quota wall (sentinel 75) or because the SHARED provider endpoint itself
+# failed (sentinel 76 — HTTP 500/502/503, incomplete stream, dropped
+# connection, transport retry-exhaustion) must be released back to
+# ``ready`` WITHOUT counting a failure, so neither a 5-hour quota window nor
+# a shared endpoint outage can trip the circuit breaker and permanently
+# block the card. The respawn guard then defers the respawn across the
+# relevant cooldown. Regression coverage for the kanban-rate-limit-failure
+# report and the 2026-08-24 10:54 incident (three workers hit the same dead
+# endpoint, exited with the generic 1, and the dispatcher mislabeled them
+# "pid not alive" crashes, tripping the breaker).
+#
+# These tests drive the requeue through the CROSS-PLATFORM worker-exit
+# channel: the worker persists its sentinel exit code + failure_reason to a
+# per-run state file (``record_worker_exit_code``), and the dispatcher's
+# crash-detect pass reads that file first (``_classify_worker_exit``). This
+# works on EVERY OS without monkeypatching the POSIX wait-status helpers
+# (``os.WIFEXITED`` / ``os.WEXITSTATUS`` / ``os.WIFSIGNALED`` /
+# ``os.WTERMSIG``), which do not exist on Windows — the pre-existing reason
+# the rate-limit requeue test was previously Windows-skipped and the
+# provider-outage test needed a ``_install_posix_wait_status`` shim.
 # ---------------------------------------------------------------------------
 
 
-def _exited_status(code: int) -> int:
-    """Raw wait-status for a WIFEXITED child with the given exit code."""
-    return code << 8
+def _record_sentinel_exit(conn, tid, pid, exit_code, failure_reason):
+    """Claim a fresh run for ``tid``, record the sentinel exit via the
+    cross-platform channel, and return the run_id.
 
-
+    Mirrors what the worker does on a sentinel failure: open a run, then
+    persist the exit code + failure_reason to the per-run state file that the
+    dispatcher's crash-detect pass reads on every OS. A fresh run is opened
+    each time so ``current_run_id`` (the channel's key) advances and a prior
+    attempt's state can't shadow this one.
+    """
+    host = kb._claimer_id().split(":", 1)[0]
+    kb.claim_task(conn, tid, claimer=f"{host}:w")
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, consecutive_failures=0 WHERE id=?",
+        (pid, tid),
+    )
+    conn.commit()
+    run_id = kb.get_task(conn, tid).current_run_id
+    kb.record_worker_exit_code(run_id, exit_code, failure_reason, pid=pid)
+    return run_id
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(
@@ -269,34 +300,24 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 ):
     """A rate-limit sentinel exit releases the task to ``ready`` and leaves
     ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    transient throttle, even across many quota-wall hits. Driven through the
+    cross-platform exit-code channel, so it passes natively on Windows."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
     with kb.connect() as conn:
-        host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
         # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
         # If any of these counted as a failure the task would be blocked.
         for i in range(6):
             pid = 70000 + i
-            # Claim to open a real run (so detect_crashed_workers can close
-            # it with a rate_limited outcome), then point the claim at this
-            # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
-            conn.execute(
-                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
-                "WHERE id=?",
-                (pid, 0, tid),
+            _record_sentinel_exit(
+                conn, tid, pid,
+                _kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limit",
             )
-            conn.commit()
-            _kb._record_worker_exit(
-                pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-            )
-
             crashed = kb.detect_crashed_workers(conn)
             # Rate-limited requeues are NOT crashes.
             assert tid not in crashed
@@ -314,6 +335,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
         # Last failure error stamped so the respawn guard recognizes the
         # quota wall.
+        task = kb.get_task(conn, tid)
         assert task.last_failure_error and "rate-limited" in task.last_failure_error
 
         # A ``rate_limited`` run outcome was recorded (not ``crashed``).
@@ -364,6 +386,231 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         # Past cooldown → allowed (None), NOT trapped by blocker_auth even
         # though last_failure_error contains "rate-limited".
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+# ---------------------------------------------------------------------------
+# Provider-outage requeue: a worker that bails because the SHARED provider
+# endpoint itself failed (HTTP 500/502/503, incomplete stream, dropped
+# connection, transport retry-exhaustion) must be released back to ``ready``
+# WITHOUT counting a failure, and the respawn guard defers it across the
+# outage cooldown so a whole lane of same-provider tasks doesn't stampede a
+# dying endpoint. Regression coverage for the 2026-08-24 10:54 incident:
+# three workers all hit the same dead endpoint, exited with the generic 1,
+# and the dispatcher mislabeled them "pid not alive" crashes, tripping the
+# breaker.
+#
+# These tests drive the requeue through the CROSS-PLATFORM worker-exit
+# channel (``record_worker_exit_code`` -> ``_classify_worker_exit`` reading
+# the per-run state file), which works on every OS WITHOUT monkeypatching the
+# POSIX wait-status helpers (``os.WIFEXITED`` / ``os.WEXITSTATUS`` /
+# ``os.WIFSIGNALED`` / ``os.WTERMSIG``). On Windows those helpers do not
+# exist and ``reap_worker_zombies`` is a no-op, so the POSIX wait-status
+# registry is never populated — the state file is the only source there.
+# ---------------------------------------------------------------------------
+
+
+def test_is_transient_provider_outage_reason_predicate():
+    """The transient-outage predicate matches exactly the server-side /
+    transport FailoverReason values and excludes rate/billing/auth/content
+    (which have their own dedicated requeue/rotation paths)."""
+    import hermes_cli.kanban_db as _kb
+
+    for reason in ("server_error", "overloaded", "timeout"):
+        assert _kb.is_transient_provider_outage_reason(reason), reason
+    for reason in (
+        "rate_limit", "upstream_rate_limit", "billing", "auth",
+        "auth_permanent", "content_policy_blocked", "model_not_found",
+        "unknown", None, "",
+    ):
+        assert not _kb.is_transient_provider_outage_reason(reason), reason
+    # The dispatcher exit-code constants are pinned and distinct from the
+    # rate-limit sentinel so the two requeue paths can't be conflated.
+    assert _kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE == 76
+    assert _kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE != _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+def test_provider_outage_exit_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A provider-outage sentinel exit releases the task to ``ready`` and
+    leaves ``consecutive_failures`` untouched — the breaker must never trip
+    on a shared endpoint outage, even across many outage hits. Driven through
+    the cross-platform exit-code channel, so it passes natively on Windows
+    WITHOUT monkeypatching the POSIX wait-status helpers."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="po", assignee="a")
+
+        # Simulate FAR more shared-endpoint-outage hits than
+        # DEFAULT_FAILURE_LIMIT (2). If any of these counted as a failure
+        # the task would be blocked.
+        for i in range(6):
+            pid = 80000 + i
+            _record_sentinel_exit(
+                conn, tid, pid,
+                _kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE, "server_error",
+            )
+            crashed = kb.detect_crashed_workers(conn)
+            # Provider-outage requeues are NOT crashes.
+            assert tid not in crashed
+            po = getattr(_kb.detect_crashed_workers, "_last_provider_outage", [])
+            assert tid in po
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: provider-outage must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # A ``provider_outage`` run outcome was recorded (not ``crashed``).
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "provider_outage" in outcomes
+        assert "crashed" not in outcomes
+
+
+def test_worker_exit_state_file_classifies_sentinel_cross_platform(
+    monkeypatch, tmp_path,
+):
+    """The state-file channel is the source of truth for the two sentinels on
+    every OS. A worker that records a sentinel exit for a run classifies as
+    that sentinel even when the POSIX wait-status registry is empty (the
+    Windows case, where ``reap_worker_zombies`` is a no-op and ``os.WIF*`` do
+    not exist). No ``os.WIF*`` helpers are touched."""
+    import hermes_cli.kanban_db as _kb
+
+    # Pin the state dir to a temp path so this never touches the shared root.
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_EXIT_DIR", str(tmp_path / "exits"))
+
+    # No POSIX wait-status registry entry is recorded — this simulates
+    # Windows, where the registry is never populated and os.WIF* are absent.
+    # A dead pid that has no registry entry AND no state file must classify
+    # as "unknown" (a genuine crash the breaker still counts).
+    assert _kb._classify_worker_exit(99999) == ("unknown", None)
+
+    # A state file for a provider-outage run classifies as provider_outage.
+    _kb.record_worker_exit_code(
+        4242, _kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE, "server_error",
+    )
+    assert _kb._classify_worker_exit(4242, run_id=4242) == (
+        "provider_outage", _kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE,
+    )
+
+    # A state file for a rate-limit run classifies as rate_limited.
+    _kb.record_worker_exit_code(
+        4243, _kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limit",
+    )
+    assert _kb._classify_worker_exit(4243, run_id=4243) == (
+        "rate_limited", _kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+
+    # The state file records ONLY the two sentinels, so it can never mask a
+    # genuine crash: recording a generic exit code (1) must NOT classify as a
+    # sentinel. (The worker only ever calls record_worker_exit_code on the
+    # sentinel paths, but the classifier must stay safe if it's ever fed a
+    # non-sentinel.)
+    _kb.record_worker_exit_code(4244, 1, "server_error")
+    assert _kb._classify_worker_exit(4244, run_id=4244) == ("unknown", None)
+
+
+def test_worker_exit_state_roundtrip_and_guards(kanban_home, monkeypatch, tmp_path):
+    """The state-file channel round-trips (exit_code, failure_reason), honours
+    the HERMES_KANBAN_WORKER_EXIT_DIR pin, and rejects missing / malformed /
+    stale / non-sentinel state. Deterministic on any OS."""
+    import hermes_cli.kanban_db as _kb
+
+    # Pin the dir so the test is hermetic and doesn't touch the shared root.
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_EXIT_DIR", str(tmp_path / "exits"))
+
+    # Round-trip.
+    p = _kb.record_worker_exit_code(
+        77, _kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE, "timeout", pid=123,
+    )
+    assert p is not None and p.is_file()
+    code, reason = _kb.read_worker_exit_code(77)
+    assert code == _kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE
+    assert reason == "timeout"
+
+    # Missing run -> (None, None).
+    assert _kb.read_worker_exit_code(9999) == (None, None)
+    assert _kb.read_worker_exit_code(None) == (None, None)
+
+    # Malformed JSON -> (None, None) (caller falls back to the registry).
+    bad = _kb._worker_exit_state_path(78)
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("{not-json", encoding="utf-8")
+    assert _kb.read_worker_exit_code(78) == (None, None)
+
+    # Non-integer exit_code -> (None, None).
+    import json as _json
+    weird = _kb._worker_exit_state_path(79)
+    weird.parent.mkdir(parents=True, exist_ok=True)
+    weird.write_text(_json.dumps({"exit_code": "76"}), encoding="utf-8")
+    assert _kb.read_worker_exit_code(79) == (None, None)
+
+    # Stale file (mtime older than TTL) -> (None, None).
+    stale = _kb._worker_exit_state_path(80)
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text(
+        _json.dumps({"run_id": 80, "exit_code": 76, "failure_reason": "timeout"}),
+        encoding="utf-8",
+    )
+    import os as _os, time as _time
+    old = _time.time() - (_kb._WORKER_EXIT_STATE_TTL_SECONDS + 10)
+    _os.utime(stale, (old, old))
+    assert _kb.read_worker_exit_code(80) == (None, None)
+
+    # record_worker_exit_code never raises and returns None without a run_id.
+    assert _kb.record_worker_exit_code(None, 76, "timeout") is None
+
+
+def test_respawn_guard_defers_provider_outage_within_cooldown(
+    kanban_home, monkeypatch,
+):
+    """Within the outage cooldown after a provider-outage requeue, the guard
+    defers the respawn; after the cooldown it allows a probe — and does NOT
+    fall into ``blocker_auth``."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_PROVIDER_OUTAGE_COOLDOWN_SECONDS", "60")
+    now = 5_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="po-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='provider_outage', "
+            "status='provider_outage', ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited on a transient provider outage "
+             "(shared endpoint failure) — requeued without counting a failure",
+             tid),
+        )
+        conn.commit()
+
+        # Inside cooldown → defer with the provider-outage-specific reason.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 30)
+        assert kb.check_respawn_guard(conn, tid) == "provider_outage_cooldown"
+
+        # Past cooldown → allowed (None), NOT trapped by blocker_auth.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 120)
         assert kb.check_respawn_guard(conn, tid) is None
 
 

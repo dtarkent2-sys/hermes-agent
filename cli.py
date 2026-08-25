@@ -20704,29 +20704,83 @@ def main(
 
                         # Ensure proper exit code for automation wrappers.
                         #
-                        # Kanban workers get a special case: when the run failed
-                        # purely because the provider rate-limited / exhausted
-                        # quota (not because the task itself is broken), exit with
-                        # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                        # dispatcher's reap classifier maps that code to a
-                        # ``rate_limited`` exit and releases the task back to
-                        # ``ready`` WITHOUT incrementing the failure counter, so a
-                        # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
-                        # plain 0/1 contract automation wrappers expect.
+                        # Kanban workers get two special cases:
+                        #  (a) the provider rate-limited / exhausted quota
+                        #      (rate_limit / billing) → exit with the
+                        #      EX_TEMPFAIL sentinel (75). The dispatcher's
+                        #      reap classifier maps that code to a
+                        #      ``rate_limited`` exit and releases the task
+                        #      back to ``ready`` WITHOUT incrementing the
+                        #      failure counter, so a 5-hour quota window
+                        #      can't trip the circuit breaker and permanently
+                        #      block the card.
+                        #  (b) the SHARED provider endpoint itself failed —
+                        #      HTTP 500/502/503, incomplete chunked stream,
+                        #      dropped connection, or retry-exhaustion on a
+                        #      transport error (server_error / overloaded /
+                        #      timeout) → exit with the EX_NOHOST sentinel
+                        #      (76). The dispatcher maps that to a
+                        #      ``provider_outage`` exit, releases the task
+                        #      WITHOUT counting a failure (so a shared outage
+                        #      can't trip the breaker), and defers the
+                        #      respawn across a short cooldown so a whole lane
+                        #      of same-provider tasks doesn't stampede the
+                        #      dying endpoint. This is the 2026-08-24 10:54
+                        #      incident fix: three workers all hit the same
+                        #      dead endpoint, exited with the generic 1, and
+                        #      the dispatcher mislabeled them "pid not alive"
+                        #      crashes, tripping the breaker.
+                        # Non-kanban runs keep the plain 0/1 contract
+                        # automation wrappers expect.
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
+                            if os.environ.get("HERMES_KANBAN_TASK"):
+                                _fr = result.get("failure_reason")
+                                if _fr in ("rate_limit", "billing"):
+                                    try:
+                                        from hermes_cli.kanban_db import (
+                                            KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                                        )
+                                        _exit_code = _RL_CODE
+                                    except Exception:
+                                        _exit_code = 1
+                                elif _fr in ("server_error", "overloaded", "timeout"):
+                                    try:
+                                        from hermes_cli.kanban_db import (
+                                            KANBAN_PROVIDER_OUTAGE_EXIT_CODE as _PO_CODE,
+                                        )
+                                        _exit_code = _PO_CODE
+                                    except Exception:
+                                        _exit_code = 1
+                                # Cross-platform sentinel channel: persist the
+                                # chosen sentinel exit code + failure_reason to a
+                                # per-run state file so the dispatcher's
+                                # crash-detect pass can classify it on every OS.
+                                # On POSIX the reaper also sees it via the
+                                # wait-status registry; on Windows the reaper is
+                                # a no-op and this file is the ONLY source. A
+                                # generic failure (exit_code == 1) writes no
+                                # state, so a real crash is never misclassified.
+                                # Never raises: a write failure must not change
+                                # the exit code.
+                                if _exit_code != 1:
+                                    try:
+                                        from hermes_cli.kanban_db import (
+                                            record_worker_exit_code as _rec_exit,
+                                        )
+                                        _run_id = os.environ.get(
+                                            "HERMES_KANBAN_RUN_ID"
+                                        )
+                                        if _run_id:
+                                            _rec_exit(
+                                                int(_run_id),
+                                                _exit_code,
+                                                _fr,
+                                                pid=os.getpid(),
+                                            )
+                                    except Exception:
+                                        pass
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails

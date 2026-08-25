@@ -429,6 +429,45 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Sentinel for a transient PROVIDER OUTAGE — the shared endpoint itself failed
+# (HTTP 500/502/503, an incomplete chunked stream, a dropped connection, or
+# retry-exhaustion on a transport error) rather than the task or the account.
+# Mirrors KANBAN_RATE_LIMIT_EXIT_CODE: the dispatcher's reap classifier maps
+# it to a ``provider_outage`` exit kind so ``detect_crashed_workers`` releases
+# the task back to ``ready`` WITHOUT counting a failure (a shared endpoint
+# outage must never trip the circuit breaker and permanently block the card,
+# which is exactly what the 2026-08-24 10:54 incident did — three workers all
+# wrote max_retries_exhausted connection dumps, exited, and the dispatcher
+# mislabeled them as "pid not alive" crashes). 76 == BSD ``EX_NOHOST``
+# (sysexits.h) — "non-existent host/address", the conventional "the backend
+# you tried to reach was unreachable" code, adjacent to EX_TEMPFAIL and well
+# clear of 0/1/2/75.
+KANBAN_PROVIDER_OUTAGE_EXIT_CODE = 76
+
+# ``failure_reason`` values (FailoverReason, agent/error_classifier.py) that
+# indicate a transient provider-side outage rather than a task, account, or
+# content failure. These are the errors a single endpoint outage produces and
+# that the dispatcher must treat as "the backend is down, not the task":
+#   server_error  — 500/502 internal server error (incl. incomplete chunked
+#                   stream surfacing as a mid-response 500)
+#   overloaded    — 503/529 provider overloaded
+#   timeout       — connection/read timeout (endpoint not answering)
+# Rate/billing/auth are deliberately EXCLUDED: a 429 is handled by the
+# KANBAN_RATE_LIMIT sentinel path, a 402/billing wall by credential rotation,
+# and an auth failure needs human action — none of those are "the endpoint
+# went down".
+TRANSIENT_PROVIDER_OUTAGE_REASONS = frozenset({
+    "server_error", "overloaded", "timeout",
+})
+
+def is_transient_provider_outage_reason(reason: "Optional[str]") -> bool:
+    """True when a ``failure_reason`` string marks a transient provider outage.
+
+    Kept as a tiny pure predicate so the worker exit path (cli.py) and the
+    dispatcher/tests share one source of truth for which reasons are transient.
+    """
+    return reason in TRANSIENT_PROVIDER_OUTAGE_REASONS
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -469,6 +508,32 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def _resolve_provider_outage_cooldown_seconds() -> int:
+    """Return the provider-outage requeue cooldown in seconds.
+
+    Mirrors ``_resolve_rate_limit_cooldown_seconds`` but for the shared-endpoint
+    outage sentinel: after a worker is released via the provider-outage path,
+    the dispatcher defers re-spawning that task for this window so it does not
+    stampede an endpoint that is already down (requirement: bounded backoff +
+    incident collapse for simultaneous same-provider failures). Reads
+    ``HERMES_KANBAN_PROVIDER_OUTAGE_COOLDOWN_SECONDS``; falls back to
+    ``DEFAULT_PROVIDER_OUTAGE_COOLDOWN_SECONDS``. A value of 0 disables the
+    cooldown (re-spawn on the next tick) — useful for tests that assert the
+    task becomes spawnable again immediately (delayed-recovery / resumption).
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_PROVIDER_OUTAGE_COOLDOWN_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_PROVIDER_OUTAGE_COOLDOWN_SECONDS
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -8003,6 +8068,16 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Cooldown after a provider-outage (shared endpoint down) requeue before the
+# dispatcher re-spawns the worker. Without this, a task released by the
+# provider-outage path would be re-spawned on the very next tick and bounce
+# straight back off the dead endpoint, so a whole lane of same-provider tasks
+# stampedes the dying host. 60s is short enough that recovery is picked up
+# quickly (an endpoint usually comes back within a minute or two) but long
+# enough to stop the retry stampede. Overridable via
+# ``HERMES_KANBAN_PROVIDER_OUTAGE_COOLDOWN_SECONDS``; 0 disables it.
+DEFAULT_PROVIDER_OUTAGE_COOLDOWN_SECONDS = 60  # 1 minute
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -8120,7 +8195,10 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
+def _classify_worker_exit(
+    pid: int,
+    run_id: Optional[int] = None,
+) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
     Returns ``(kind, code)`` where ``kind`` is one of:
@@ -8129,21 +8207,57 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       task is still ``running`` in the DB, this is a protocol violation
       (worker exited without calling ``kanban_complete`` / ``kanban_block``)
       and should be auto-blocked immediately — retrying will just loop.
-    * ``"rate_limited"`` — ``WIFEXITED`` with status
+    * ``"rate_limited"`` — a worker exit of
       ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"provider_outage"`` — a worker exit of
+      ``KANBAN_PROVIDER_OUTAGE_EXIT_CODE``. The worker bailed because the
+      SHARED provider endpoint itself failed (HTTP 500/502/503, incomplete
+      stream, dropped connection, transport retry-exhaustion), NOT because
+      the task or account failed. ``detect_crashed_workers`` releases the
+      task back to ``ready`` without counting a failure, and
+      ``check_respawn_guard`` defers the respawn across the outage cooldown
+      so a whole lane of same-provider tasks doesn't stampede the dying
+      endpoint (the 2026-08-24 10:54 incident fix).
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
       something else, or died between reap tick and liveness check). Fall
       back to existing crashed-counter behavior.
 
-    ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
+    The two sentinel kinds are recognised from two sources, consulted in
+    this order:
+
+    1. **The cross-platform worker-exit state file** (keyed by ``run_id``),
+       written by the worker right before it exits with a sentinel code.
+       This is the ONLY source that works on Windows, where
+       ``reap_worker_zombies`` is a no-op and the ``os.WIF*`` helpers do not
+       exist. Because a worker only ever records the two sentinel codes
+       here, a state file can NEVER misclassify a genuine crash — a real
+       crash (exit 1/2, a signal) leaves no state file, so this step is a
+       no-op for it and the crash is still counted.
+    2. **The POSIX wait-status registry** (``_recent_worker_exits``,
+       populated by the reap loop on POSIX). Authoritative where reaping is
+       live; it also covers a sentinel exit for which the worker failed to
+       write its state file.
+
+    ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /\
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
+    # 1. Cross-platform sentinel channel (every OS, incl. Windows). Consulted
+    #    first so the sentinel paths work where POSIX reaping is inert. A
+    #    state file records only the two sentinel codes, so it cannot mask a
+    #    genuine crash — anything else falls through to the registry below.
+    if run_id is not None:
+        state_code, _state_reason = read_worker_exit_code(run_id)
+        if state_code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", state_code)
+        if state_code == KANBAN_PROVIDER_OUTAGE_EXIT_CODE:
+            return ("provider_outage", state_code)
+    # 2. POSIX wait-status registry (authoritative where reaping is live).
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
@@ -8155,6 +8269,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_PROVIDER_OUTAGE_EXIT_CODE:
+                return ("provider_outage", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8184,6 +8300,130 @@ def reap_worker_zombies() -> "list[int]":
         except Exception:
             pass
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform worker -> dispatcher exit-code channel.
+#
+# The POSIX wait-status registry above (``_recent_worker_exits`` populated by
+# ``reap_worker_zombies``) is the ONLY way a dispatcher observes a worker's
+# exit code on POSIX — and it is inert on Windows: ``reap_worker_zombies``
+# is a no-op there (no reaping) and ``os.WIFEXITED`` / ``os.WEXITSTATUS`` /
+# ``os.WIFSIGNALED`` / ``os.WTERMSIG`` do not exist, so
+# ``_classify_worker_exit`` always falls through to ``("unknown", None)``
+# and every dead worker is mislabeled a "pid not alive" crash. That is
+# exactly the 2026-08-24 10:54 incident (and the same pre-existing gap also
+# blinds the sentinel-75 rate-limit path on this host).
+#
+# This channel is the cross-platform replacement: a kanban worker that bails
+# on one of the two *sentinel* failure reasons (``rate_limit`` / ``billing``
+# -> 75, or a transient provider outage -> 76) persists its chosen exit code
+# + failure_reason to a per-run state file before ``sys.exit``; the
+# dispatcher's crash-detect pass reads that file first and falls back to the
+# POSIX wait-status registry only when the file is absent. Because a worker
+# only ever writes a sentinel file on the sentinel paths, this can NEVER
+# misclassify a genuine crash (exit 1/2, a signal) — a real crash leaves no
+# file, so the dispatcher sees ``unknown`` and counts the failure exactly as
+# before. The file is keyed by the run id, which is unique per attempt, so a
+# retried task's new run cannot be shadowed by the previous attempt's state.
+# ---------------------------------------------------------------------------
+_WORKER_EXIT_STATE_TTL_SECONDS = 600
+
+
+def _worker_exit_dir() -> Path:
+    """Return the shared directory holding per-run worker-exit state files.
+
+    Anchored at the shared kanban root (NOT board-scoped): run ids are
+    globally unique across the shared board, and the dispatcher + worker may
+    resolve different boards from the same root, so a single shared dir is
+    the one location both sides agree on. ``HERMES_KANBAN_WORKER_EXIT_DIR``
+    pins the path directly (highest precedence) — the dispatcher injects it
+    into the worker env at spawn so the two always match.
+    """
+    override = os.environ.get("HERMES_KANBAN_WORKER_EXIT_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return kanban_home() / "kanban" / "worker_exits"
+
+
+def _worker_exit_state_path(run_id: Optional[int]) -> Path:
+    """Return the per-run worker-exit state-file path for ``run_id``."""
+    return _worker_exit_dir() / f"run_{int(run_id)}.json"
+
+
+def record_worker_exit_code(
+    run_id: Optional[int],
+    exit_code: int,
+    failure_reason: Optional[str] = None,
+    *,
+    pid: Optional[int] = None,
+) -> Optional[Path]:
+    """Persist a worker's sentinel exit code for the dispatcher to observe.
+
+    Called from the worker exit path (``cli.py``) right before ``sys.exit``
+    when the run bailed on a sentinel failure reason. Writes a tiny JSON
+    file (``{"run_id", "exit_code", "failure_reason", "pid", "at"}``) so the
+    dispatcher's crash-detect pass can classify the exit cross-platform.
+
+    Never raises: a failure to write the state file must not change the
+    worker's own exit code. Returns the path written, or ``None`` on any
+    error (or when ``run_id`` is falsy — non-kanban / unrun context).
+    """
+    if run_id is None:
+        return None
+    try:
+        path = _worker_exit_state_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({
+            "run_id": int(run_id),
+            "exit_code": int(exit_code),
+            "failure_reason": failure_reason,
+            "pid": int(pid) if pid else None,
+            "at": int(time.time()),
+        })
+        # Write-then-rename so the dispatcher never reads a torn file: a
+        # partially-written state file must look absent, not corrupt.
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:
+        return None
+
+
+def read_worker_exit_code(
+    run_id: Optional[int]
+) -> "tuple[Optional[int], Optional[str]]":
+    """Read a worker's persisted sentinel exit code for ``run_id``.
+
+    Returns ``(exit_code, failure_reason)`` when a valid, non-stale state
+    file exists, else ``(None, None)``. A missing / malformed / stale file
+    all collapse to ``(None, None)`` so the caller falls back to the POSIX
+    wait-status registry (or, on Windows, to the ``unknown`` crash path).
+    """
+    if run_id is None:
+        return (None, None)
+    try:
+        path = _worker_exit_state_path(run_id)
+        if not path.is_file():
+            return (None, None)
+        # Stale-file guard: ignore a state file older than the TTL so a
+        # leftover from a long-dead attempt can't shadow a later classification.
+        age = time.time() - path.stat().st_mtime
+        if age > _WORKER_EXIT_STATE_TTL_SECONDS:
+            return (None, None)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return (None, None)
+        code = data.get("exit_code")
+        if not isinstance(code, int):
+            return (None, None)
+        reason = data.get("failure_reason")
+        if reason is not None and not isinstance(reason, str):
+            reason = None
+        return (code, reason)
+    except Exception:
+        return (None, None)
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -8879,6 +9119,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    provider_outage: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -8892,7 +9133,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, "
+            "current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -8914,8 +9156,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            kind, code = _classify_worker_exit(
+                pid,
+                run_id=row["current_run_id"],
+            )
             rate_limited_exit = False
+            provider_outage_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -8963,6 +9209,34 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "provider_outage":
+                # Worker bailed because the SHARED provider endpoint itself
+                # failed (EX_NOHOST sentinel): an HTTP 500/502/503, an
+                # incomplete chunked stream, a dropped connection, or
+                # retry-exhaustion on a transport error. This is NOT a task
+                # failure and NOT an account quota wall — the task is fine,
+                # the backend just went down. Release it back to its source
+                # phase WITHOUT counting a failure (skip ``_record_task_failure``)
+                # so a shared outage can't trip the circuit breaker and
+                # permanently block the card (the 2026-08-24 10:54 incident:
+                # three workers all hit the same dead endpoint and were
+                # mislabeled as "pid not alive" crashes, which tripped the
+                # breaker). ``check_respawn_guard`` defers the respawn with a
+                # cooldown so we don't stampede the dying endpoint, and the
+                # terminal model error is preserved on the task so the board
+                # shows WHY the run stopped instead of a bare "pid not alive".
+                protocol_violation = False
+                provider_outage_exit = True
+                error_text = (
+                    f"pid {pid} exited on a transient provider outage "
+                    f"(shared endpoint failure) — requeued without counting a failure"
+                )
+                event_kind = "provider_outage"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -8987,10 +9261,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited and provider-outage requeues are clean releases,
+                # not crashes — record the run outcome accordingly so the board
+                # history doesn't show a phantom crash for a quota wall or a
+                # shared endpoint going down.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif provider_outage_exit:
+                    _run_outcome = "provider_outage"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9023,6 +9303,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif provider_outage_exit:
+                    # Mirror the rate-limit path: stamp the failure error so
+                    # the board shows the terminal model error (NOT a bare
+                    # "pid not alive") and ``check_respawn_guard`` defers the
+                    # respawn across the outage — WITHOUT touching
+                    # ``consecutive_failures`` so the shared outage can't trip
+                    # the circuit breaker.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    provider_outage.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9132,6 +9424,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for provider-outage requeues (shared endpoint down) —
+    # also NOT a failure and NOT a crash.
+    detect_crashed_workers._last_provider_outage = provider_outage  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -9487,6 +9782,40 @@ def check_respawn_guard(
         # stamped on the task; this path intentionally retries forever
         # (cheaply, spaced by the cooldown) until quota returns or a real
         # crash/completion supersedes it.
+        return None
+
+    # 1b. Provider-outage cooldown. The most recent run ended
+    #     ``provider_outage`` (the shared endpoint itself went down — HTTP
+    #     500/502/503, incomplete chunked stream, dropped connection, or
+    #     retry-exhaustion on a transport error). Defer re-spawn for the
+    #     outage cooldown window so a whole lane of same-provider tasks does
+    #     not stampede an endpoint that is already down (requirement: bounded
+    #     backoff + incident collapse for simultaneous failures). We look at
+    #     the LATEST run only: if a newer crash/completion superseded the
+    #     outage run, this guard no longer applies and the normal paths take
+    #     over. When the cooldown elapses we fall through and respawn — a
+    #     cheap probe that confirms the endpoint is back before the lane
+    #     resumes (delayed-recovery / successful-resumption semantics).
+    po_cooldown = _resolve_provider_outage_cooldown_seconds()
+    po_latest = conn.execute(
+        "SELECT outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if po_latest is not None and po_latest["outcome"] == "provider_outage":
+        if po_cooldown <= 0:
+            # Cooldown disabled — respawn immediately.
+            return None
+        po_ended_at = po_latest["ended_at"]
+        if po_ended_at is not None and (now - int(po_ended_at)) < po_cooldown:
+            return "provider_outage_cooldown"
+        # Cooldown elapsed — allow the respawn. Return early so the
+        # blocker_auth check below doesn't catch the provider-outage text we
+        # stamped on the task; this path retries (spaced by the cooldown)
+        # until the endpoint recovers or a real crash/completion supersedes
+        # it. No failure counter is touched on this path, so the circuit
+        # breaker can never trip on a shared outage.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
@@ -10818,6 +11147,11 @@ def _default_spawn(
     # but unusual symlink / Docker layouts are caught here too.
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    # Pin the shared worker-exit state dir so the worker's sentinel exit-code
+    # file lands where the dispatcher's crash-detect pass reads it, even on
+    # exotic / Docker layouts where kanban_home() could diverge between the
+    # two processes.
+    env["HERMES_KANBAN_WORKER_EXIT_DIR"] = str(_worker_exit_dir())
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
