@@ -712,9 +712,10 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: float = 540.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        in_progress_tool_timeout: float = 300.0,
         first_output_timeout: Optional[float] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
@@ -727,13 +728,19 @@ class CodexAppServerSession:
         Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
 
+        in_progress_tool_timeout: if codex emits ``item/started`` for a tool
+        but never emits the matching completion, fast-fail and retire after
+        this many seconds. This is deliberately longer than the post-tool
+        quiet window so legitimate browser commands can run, but shorter than
+        the default 600s cron inactivity limit. Set to 0 to disable.
+
         first_output_timeout: time-to-first-output (TTFB) watchdog. A codex
         subprocess can accept `turn/start` and then emit NOTHING (no
         notifications at all) for the entire turn — a wedged/admission-stalled
-        backend that the outer turn deadline (600s by default) would let burn
-        the full limit, which also happens to equal the cron inactivity
-        timeout, so cron's own watchdog kills the run at `initializing` with
-        no agent-side backstop. If no substantive turn activity (item output,
+        backend that could otherwise race the cron inactivity watchdog. The
+        default 540s outer turn deadline deliberately leaves 60s of headroom
+        before cron's 600s limit, while this narrower first-output guard usually
+        fails much sooner. If no substantive turn activity (item output,
         tool activity, or completion) arrives within this many seconds of
         `turn/start`, fast-fail and retire the session. Lifecycle-only
         acknowledgements such as `turn/started` do not disarm the guard.
@@ -844,6 +851,7 @@ class CodexAppServerSession:
         # a legitimately-long tool (>90s, e.g. a multi-step browser publish)
         # trips the post-tool watchdog mid-execution and retires the session.
         tool_in_progress: Optional[str] = None
+        tool_started_at: Optional[float] = None
         # First-output state: becomes True only after substantive progress for
         # this turn (an item event/delta or turn completion). A bare lifecycle
         # acknowledgement such as turn/started is intentionally insufficient:
@@ -871,6 +879,28 @@ class CodexAppServerSession:
                         "codex app-server subprocess exited unexpectedly",
                         tail_lines=20,
                     )
+                result.should_retire = True
+                break
+
+            # A started tool can itself wedge (for example a commandExecution
+            # whose child process never reports completion). Treat that
+            # separately from post-tool silence: the latter remains suppressed
+            # while a legitimate tool runs, but in-progress silence still needs
+            # a deadline below cron's outer 600s inactivity watchdog.
+            if (
+                in_progress_tool_timeout > 0
+                and tool_in_progress is not None
+                and tool_started_at is not None
+                and (time.monotonic() - tool_started_at)
+                    > in_progress_tool_timeout
+            ):
+                self._issue_interrupt(result.turn_id)
+                result.interrupted = True
+                result.error = (
+                    f"codex tool execution {tool_in_progress!r} emitted no "
+                    f"completion for {in_progress_tool_timeout:.0f}s; "
+                    f"retiring app-server session."
+                )
                 result.should_retire = True
                 break
 
@@ -964,6 +994,15 @@ class CodexAppServerSession:
                     _apply_token_usage_notification(result, pending)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
+                    pending_method = pending.get("method", "")
+                    pending_item = (pending.get("params") or {}).get("item") or {}
+                    if pending_method == "item/started" and _is_tool_item(pending_item):
+                        tool_in_progress = pending_item.get("id") or None
+                        tool_started_at = time.monotonic()
+                        last_tool_completion_at = None
+                    elif pending_method == "item/completed" and _is_tool_item(pending_item):
+                        tool_in_progress = None
+                        tool_started_at = None
                     proj = projector.project(pending)
                     if proj.messages:
                         result.projected_messages.extend(proj.messages)
@@ -1031,6 +1070,7 @@ class CodexAppServerSession:
             item = (note.get("params") or {}).get("item") or {}
             if method == "item/started" and _is_tool_item(item):
                 tool_in_progress = item.get("id") or None
+                tool_started_at = time.monotonic()
                 # A freshly-started tool means codex is alive and busy; clear
                 # any stale quiet-timer anchor from a prior completed tool.
                 last_tool_completion_at = None
@@ -1042,6 +1082,7 @@ class CodexAppServerSession:
                 # shift the watchdog's timing semantics.
                 if tool_in_progress is not None:
                     tool_in_progress = None
+                    tool_started_at = None
 
             # Project into messages
             projection = projector.project(note)

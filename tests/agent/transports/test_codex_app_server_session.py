@@ -890,6 +890,52 @@ class TestSessionRetirement:
         # The turn should have completed, not been interrupted by the watchdog.
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
+    def test_default_turn_deadline_precedes_cron_inactivity_limit(self):
+        """The app-server deadline must win the race against cron's 600s
+        inactivity watchdog even when an intermediate event bypasses narrower
+        TTFB/post-tool guards."""
+        import inspect
+
+        default_timeout = inspect.signature(CodexAppServerSession.run_turn).parameters[
+            "turn_timeout"
+        ].default
+        assert default_timeout <= 540.0
+
+    def test_in_progress_tool_silence_fast_fails_before_turn_deadline(self):
+        """A tool that starts but never completes must not inherit the full
+        600s turn deadline. This reproduces the sq-x-daily-engagement Mode B
+        wedge: codex accepted the turn and emitted commandExecution/started,
+        then went silent until cron's 600s inactivity watchdog killed Hermes.
+        """
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "commandExecution",
+                "id": "exec-wedged",
+                "command": "node x_reply_publish.mjs",
+                "cwd": "/tmp",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        s = make_session(client)
+
+        r = s.run_turn(
+            "publish the replies",
+            turn_timeout=0.20,
+            notification_poll_timeout=0.005,
+            post_tool_quiet_timeout=0.01,
+            in_progress_tool_timeout=0.04,
+        )
+
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "tool execution" in r.error
+        assert "exec-wedged" in r.error
+        assert "timed out after 0.2s" not in r.error
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
     def test_post_tool_watchdog_still_fires_after_completion_and_true_silence(self):
         """After a tool COMPLETES and codex then genuinely goes silent (no new
         tool started), the watchdog must still fire — the fix only suppresses
