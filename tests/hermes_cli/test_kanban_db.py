@@ -25,6 +25,13 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Pin the worker-exit state dir to a temp path so tests that record
+    # sentinel exits (e.g. the requeue tests via _record_sentinel_exit) are
+    # hermetic and never write run_<n>.json into the live production
+    # worker_exits dir inherited from the ambient environment.
+    monkeypatch.setenv(
+        "HERMES_KANBAN_WORKER_EXIT_DIR", str(tmp_path / "worker_exits"),
+    )
     kb.init_db()
     return home
 
