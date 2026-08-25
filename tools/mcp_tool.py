@@ -7165,6 +7165,121 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Pruning disabled servers out of the live registry
+# ---------------------------------------------------------------------------
+
+def _shutdown_one_mcp_task(name: str, task: "MCPServerTask") -> None:
+    """Tear down a single MCP server task on the MCP event loop (best-effort).
+
+    Runs ``task.shutdown()`` on the shared loop so the anyio cancel-scope
+    cleanup happens in the task that opened the connection. If no live loop
+    exists there is no reconnect/park loop driving the task; we still flag
+    shutdown and drop its tools so it leaves no phantom schema behind.
+    """
+    try:
+        with _lock:
+            loop = _mcp_loop
+        if loop is not None and loop.is_running():
+            from agent.async_utils import safe_schedule_threadsafe
+            future = safe_schedule_threadsafe(
+                task.shutdown(),
+                loop,
+                logger=logger,
+                log_message=f"MCP prune: failed to schedule shutdown for '{name}'",
+            )
+            if future is not None:
+                try:
+                    future.result(timeout=10)
+                except BaseException:
+                    logger.debug(
+                        "MCP prune: shutdown of '%s' did not complete cleanly",
+                        name,
+                    )
+        else:
+            # No live loop: no active reconnect/park loop. Flag shutdown so the
+            # run loop exits if it ever (re)starts, and drop the tools now.
+            task._shutdown_event.set()
+            task._reconnect_event.set()
+            task._deregister_tools()
+    except Exception:
+        logger.debug("MCP prune: failed to shut down '%s'", name, exc_info=True)
+
+
+def _prune_disabled_mcp_servers(active_servers: Dict[str, dict]) -> List[str]:
+    """Evict live MCP server tasks that are disabled or absent in config.
+
+    The connection registry is add-only: ``register_mcp_servers`` /
+    ``discover_mcp_tools`` connect servers that are enabled in config but never
+    disconnect one whose ``enabled`` later flips to ``false`` (or whose entry is
+    removed). In a long-lived gateway process that means a disabled server's
+    task survives a config hot-reload and keeps parking on reconnect and
+    reloading its OAuth token on every discovery pass / disk-watch. This helper
+    closes the gap: on each discovery pass it shuts down any registered task
+    whose config now disables or omits it, so the in-process registry converges
+    to the on-disk config. A server is kept only when its config entry exists
+    and is not explicitly disabled.
+
+    Returns the list of pruned server names (empty if nothing to do).
+    """
+    def _still_enabled(name: str) -> bool:
+        cfg = active_servers.get(name)
+        if not isinstance(cfg, dict):
+            return False
+        return _parse_boolish(cfg.get("enabled", True), default=True)
+
+    with _lock:
+        stale = [
+            (name, task)
+            for name, task in list(_servers.items())
+            if not _still_enabled(name)
+        ]
+        stale_lazy = [
+            name
+            for name in list(_lazy_server_configs)
+            if not _still_enabled(name)
+        ]
+
+    if not stale and not stale_lazy:
+        return []
+
+    for name, task in stale:
+        _shutdown_one_mcp_task(name, task)
+
+    with _lock:
+        for name, _task in stale:
+            _servers.pop(name, None)
+            _server_connecting.discard(name)
+            _server_connect_errors.pop(name, None)
+            _server_connect_retry_after.pop(name, None)
+            _server_connect_failures.pop(name, None)
+        for name in stale_lazy:
+            _lazy_server_configs.pop(name, None)
+            _lazy_server_fingerprints.pop(name, None)
+            _lazy_server_tool_names.pop(name, None)
+
+    # Drop the OAuth provider entry so the disk-watch "tokens file changed /
+    # forcing reload" path stops for a disabled server. Best-effort: never let
+    # an OAuth-manager hiccup block discovery.
+    for name, _task in stale:
+        try:
+            from tools.mcp_oauth_manager import get_manager
+            get_manager().evict(name)
+        except Exception:
+            logger.debug(
+                "MCP prune: failed to evict OAuth entry for '%s'",
+                name,
+                exc_info=True,
+            )
+
+    if stale:
+        logger.info(
+            "MCP prune: shut down %d disabled/absent server(s): %s",
+            len(stale), ", ".join(sorted(name for name, _ in stale)),
+        )
+    return [name for name, _ in stale]
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -7395,6 +7510,15 @@ def discover_mcp_tools() -> List[str]:
         List of all registered MCP tool names.
     """
     servers = _load_mcp_config()
+
+    # Converge the live registry to config before connecting. The registry is
+    # otherwise add-only, so a server disabled or removed mid-uptime (e.g. via
+    # a config.yaml hot-reload in a long-lived gateway) would keep its task
+    # registered and keep parking on reconnect + reloading its OAuth token on
+    # every discovery pass / disk-watch. Pruning here is pure teardown (no SDK
+    # needed) and is a no-op when the registry already matches config.
+    _prune_disabled_mcp_servers(servers if isinstance(servers, dict) else {})
+
     if not servers:
         logger.debug("No MCP servers configured")
         return []
