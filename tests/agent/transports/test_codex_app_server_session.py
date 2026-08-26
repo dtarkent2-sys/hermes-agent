@@ -1112,6 +1112,47 @@ class TestFirstOutputWatchdog:
         assert r.error and "no first byte" in r.error
         assert any(method == "turn/interrupt" for method, _ in client.requests)
 
+    def test_ttfb_fast_fail_survives_closed_transport(self):
+        """Regression (2026-08-24 10:22 cron burn): when the TTFB watchdog
+        fires on a wedged app-server, the turn/interrupt RPC cannot reach a
+        dead transport — request() -> _send() raises
+        'codex app-server stdin closed unexpectedly' (RuntimeError). That
+        RuntimeError must NOT escape _issue_interrupt and crash the fast-fail:
+        run_turn has to return the clean TurnResult(error 'no first byte' +
+        should_retire) instead of throwing and letting cron's 600s inactivity
+        watchdog win the race at 'initializing'."""
+        client = FakeClient()
+
+        # Reuse FakeClient's default routing for thread/start + turn/start,
+        # but wedge ONLY the turn/interrupt that the TTFB path issues. The
+        # wedged branch records the attempt itself (orig_request would have
+        # done the bookkeeping) so we can assert it was reached.
+        orig_request = client.request
+
+        def request(method, params=None, timeout=30.0):
+            if method == "turn/interrupt":
+                client.requests.append((method, params or {}))
+                raise RuntimeError(
+                    "codex app-server stdin closed unexpectedly: "
+                    "I/O operation on closed file."
+                )
+            return orig_request(method, params, timeout)
+
+        client.request = request  # type: ignore[assignment]
+        s = make_session(client)
+        # Must return cleanly — NOT raise — despite the wedged interrupt path.
+        r = s.run_turn(
+            "silence then wedged transport",
+            turn_timeout=600.0,
+            notification_poll_timeout=0.0,
+            first_output_timeout=0.02,
+        )
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "no first byte" in r.error
+        # The interrupt was still attempted (best-effort), not skipped.
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
     def test_substantive_notification_disarms_watchdog(self):
         """An item event is substantive progress and disarms TTFB; the turn
         can then continue through normal completion."""

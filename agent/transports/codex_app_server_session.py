@@ -1364,6 +1364,23 @@ class CodexAppServerSession:
     # ---------- internals ----------
 
     def _issue_interrupt(self, turn_id: Optional[str]) -> None:
+        """Best-effort ``turn/interrupt`` to stop wasted compute.
+
+        Every watchdog that calls this (TTFB no-first-byte, post-tool silence,
+        in-progress tool, outer deadline, compaction) has *already decided* to
+        fast-fail and retire the session; the interrupt only tells codex to stop
+        the in-flight turn. It is therefore non-fatal when the transport cannot
+        carry the request — and on a wedged app-server it almost always can't:
+        the same stall that tripped the watchdog leaves the subprocess unable to
+        answer a second RPC, so ``request()`` -> ``_send()`` raises ``RuntimeError``
+        ("codex app-server stdin closed unexpectedly" / "client is closed").
+
+        Swallowing that ``RuntimeError`` is load-bearing: letting it escape used
+        to crash the TTFB fast-fail mid-fire (observed in the 2026-08-24 10:22
+        cron burn), so the clean ``TurnResult(error + should_retire)`` was never
+        returned and the run fell through to the 600s cron inactivity watchdog
+        at ``initializing`` instead of retiring in ~90-120s.
+        """
         if self._client is None or self._thread_id is None or turn_id is None:
             return
         try:
@@ -1377,6 +1394,11 @@ class CodexAppServerSession:
             logger.debug("turn/interrupt non-fatal: %s", exc)
         except TimeoutError:
             logger.warning("turn/interrupt timed out")
+        except RuntimeError as exc:
+            # Transport is gone (stdin closed / client closed) on a wedged
+            # app-server. Expected at retire time; the session is being torn
+            # down anyway, so do NOT let this escape the watchdog's fast-fail.
+            logger.debug("turn/interrupt non-fatal (transport closed): %s", exc)
 
     def _handle_server_request(self, req: dict) -> None:
         """Translate a codex server request (approval) into Hermes' approval
