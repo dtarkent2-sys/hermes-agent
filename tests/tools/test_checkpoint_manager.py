@@ -494,6 +494,20 @@ class TestGitEnvIsolation:
         env = _git_env(store, f"~/{tilde_work.name}")
         assert env["GIT_WORK_TREE"] == str(tilde_work.resolve())
 
+    def test_bare_maintenance_omits_worktree(self, tmp_path):
+        store = tmp_path / "store"
+        work = tmp_path / "work"
+        work.mkdir()
+        subprocess.run(["git", "init", "--bare", str(store)], check=True,
+                       capture_output=True, text=True)
+
+        ok, _, stderr = _run_git(
+            ["reflog", "expire", "--expire=now", "--all"],
+            store, str(work), use_worktree=False,
+        )
+
+        assert ok, stderr
+
 
 # =========================================================================
 # Error resilience

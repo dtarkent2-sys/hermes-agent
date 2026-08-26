@@ -294,6 +294,7 @@ def _git_env(
     store: Path,
     working_dir: str,
     index_file: Optional[Path] = None,
+    use_worktree: bool = True,
 ) -> dict:
     """Build env dict that redirects git to the shared store.
 
@@ -317,7 +318,10 @@ def _git_env(
     from tools.environments.local import build_subprocess_env
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     env["GIT_DIR"] = str(store)
-    env["GIT_WORK_TREE"] = str(normalized_working_dir)
+    if use_worktree:
+        env["GIT_WORK_TREE"] = str(normalized_working_dir)
+    else:
+        env.pop("GIT_WORK_TREE", None)
     env.pop("GIT_NAMESPACE", None)
     env.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
     if index_file is not None:
@@ -359,6 +363,7 @@ def _run_git(
     timeout: int = _GIT_TIMEOUT,
     allowed_returncodes: Optional[Set[int]] = None,
     index_file: Optional[Path] = None,
+    use_worktree: bool = True,
 ) -> Tuple[bool, str, str]:
     """Run a git command against the shared store.  Returns (ok, stdout, stderr).
 
@@ -367,16 +372,21 @@ def _run_git(
     Example: ``git diff --cached --quiet`` returns 1 when changes exist.
     """
     normalized_working_dir = _normalize_path(working_dir)
-    if not normalized_working_dir.exists():
+    if use_worktree and not normalized_working_dir.exists():
         msg = f"working directory not found: {normalized_working_dir}"
         logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
-    if not normalized_working_dir.is_dir():
+    if use_worktree and not normalized_working_dir.is_dir():
         msg = f"working directory is not a directory: {normalized_working_dir}"
         logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
 
-    env = _git_env(store, str(normalized_working_dir), index_file=index_file)
+    env = _git_env(
+        store,
+        str(normalized_working_dir),
+        index_file=index_file,
+        use_worktree=use_worktree,
+    )
     cmd = ["git"] + list(args)
     allowed_returncodes = allowed_returncodes or set()
 
@@ -1445,11 +1455,11 @@ class CheckpointManager:
         # Reclaim objects from the dropped commits.
         _run_git(
             ["reflog", "expire", "--expire=now", "--all"],
-            store, working_dir,
+            store, working_dir, use_worktree=False,
         )
         _run_git(
             ["gc", "--prune=now", "--quiet"],
-            store, working_dir, timeout=_GIT_TIMEOUT * 3,
+            store, working_dir, timeout=_GIT_TIMEOUT * 3, use_worktree=False,
         )
         _repair_bare_repo_dirs(store)
 
@@ -1533,11 +1543,11 @@ class CheckpointManager:
 
         _run_git(
             ["reflog", "expire", "--expire=now", "--all"],
-            store, str(store.parent),
+            store, str(store.parent), use_worktree=False,
         )
         _run_git(
             ["gc", "--prune=now", "--quiet"],
-            store, str(store.parent), timeout=_GIT_TIMEOUT * 3,
+            store, str(store.parent), timeout=_GIT_TIMEOUT * 3, use_worktree=False,
         )
         _repair_bare_repo_dirs(store)
 
@@ -1881,11 +1891,11 @@ def prune_checkpoints(
         # GC the store to reclaim unreachable objects from dropped refs.
         _run_git(
             ["reflog", "expire", "--expire=now", "--all"],
-            store, str(base),
+            store, str(base), use_worktree=False,
         )
         _run_git(
             ["gc", "--prune=now", "--quiet"],
-            store, str(base), timeout=_GIT_TIMEOUT * 3,
+            store, str(base), timeout=_GIT_TIMEOUT * 3, use_worktree=False,
         )
         _repair_bare_repo_dirs(store)
 
