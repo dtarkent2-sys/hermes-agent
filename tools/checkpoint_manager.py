@@ -356,6 +356,41 @@ def _repair_bare_repo_dirs(store: Path) -> None:
                 )
 
 
+def _run_store_gc(store: Path, working_dir: str) -> int:
+    """Run bare-store maintenance GC (``reflog expire`` + ``gc``).
+
+    The required bare-repo dirs (``refs/``, ``branches/``) are repaired
+    BEFORE the first maintenance git command, not only after: when a prior
+    GC has already removed them, running ``git reflog expire`` / ``git gc``
+    against a bare store that is missing ``refs/`` fatals with
+    ``rc=128 fatal: not a git repository`` on the very first pass (the
+    "cold-store" ordering bug).  Repairing first makes that first pass
+    succeed; the post-GC repair is preserved because ``git gc`` can remove
+    the empty dirs again within the same call.
+
+    All commands run bare (``use_worktree=False``) against the shared store.
+    Returns the number of maintenance git commands that failed (0, 1, or 2)
+    so a caller can surface a real error count instead of reporting a clean
+    run after an ``rc=128``.
+    """
+    _repair_bare_repo_dirs(store)
+    failures = 0
+    ok_reflog, _, _ = _run_git(
+        ["reflog", "expire", "--expire=now", "--all"],
+        store, working_dir, use_worktree=False,
+    )
+    if not ok_reflog:
+        failures += 1
+    ok_gc, _, _ = _run_git(
+        ["gc", "--prune=now", "--quiet"],
+        store, working_dir, timeout=_GIT_TIMEOUT * 3, use_worktree=False,
+    )
+    if not ok_gc:
+        failures += 1
+    _repair_bare_repo_dirs(store)
+    return failures
+
+
 def _run_git(
     args: List[str],
     store: Path,
@@ -1453,15 +1488,7 @@ class CheckpointManager:
         _run_git(["update-ref", ref, new_parent], store, working_dir)
 
         # Reclaim objects from the dropped commits.
-        _run_git(
-            ["reflog", "expire", "--expire=now", "--all"],
-            store, working_dir, use_worktree=False,
-        )
-        _run_git(
-            ["gc", "--prune=now", "--quiet"],
-            store, working_dir, timeout=_GIT_TIMEOUT * 3, use_worktree=False,
-        )
-        _repair_bare_repo_dirs(store)
+        _run_store_gc(store, working_dir)
 
     def _enforce_size_cap(self, store: Path) -> None:
         """If total store size exceeds ``max_total_size_mb``, drop oldest
@@ -1541,15 +1568,7 @@ class CheckpointManager:
             if not any_dropped:
                 break
 
-        _run_git(
-            ["reflog", "expire", "--expire=now", "--all"],
-            store, str(store.parent), use_worktree=False,
-        )
-        _run_git(
-            ["gc", "--prune=now", "--quiet"],
-            store, str(store.parent), timeout=_GIT_TIMEOUT * 3, use_worktree=False,
-        )
-        _repair_bare_repo_dirs(store)
+        _run_store_gc(store, str(store.parent))
 
 
 def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
@@ -1735,7 +1754,10 @@ def prune_checkpoints(
     also deleted.
 
     Returns a dict with counts ``{"scanned", "deleted_orphan",
-    "deleted_stale", "errors", "bytes_freed"}``.
+    "deleted_stale", "errors", "bytes_freed"}``.  ``errors`` counts every
+    failure that touched the store: legacy/pre-v2 deletion errors, and any
+    maintenance git command (``reflog expire`` / ``gc``) that returned
+    non-zero, so a caller cannot report a clean run after an ``rc=128``.
 
     Never raises — maintenance must never block interactive startup.
     """
@@ -1889,15 +1911,9 @@ def prune_checkpoints(
                 result["deleted_stale"] += 1
 
         # GC the store to reclaim unreachable objects from dropped refs.
-        _run_git(
-            ["reflog", "expire", "--expire=now", "--all"],
-            store, str(base), use_worktree=False,
-        )
-        _run_git(
-            ["gc", "--prune=now", "--quiet"],
-            store, str(base), timeout=_GIT_TIMEOUT * 3, use_worktree=False,
-        )
-        _repair_bare_repo_dirs(store)
+        # Count any maintenance-command failure so the result cannot claim a
+        # clean run (Errors: 0) after an rc=128 against the store.
+        result["errors"] += _run_store_gc(store, str(base))
 
         # Size-cap pass across remaining projects.
         if max_total_size_mb > 0:
@@ -1961,15 +1977,7 @@ def prune_checkpoints(
                     any_drop = True
                 if not any_drop:
                     break
-            _run_git(
-                ["reflog", "expire", "--expire=now", "--all"],
-                store, str(base), use_worktree=False,
-            )
-            _run_git(
-                ["gc", "--prune=now", "--quiet"],
-                store, str(base), timeout=_GIT_TIMEOUT * 3, use_worktree=False,
-            )
-            _repair_bare_repo_dirs(store)
+            result["errors"] += _run_store_gc(store, str(base))
 
     size_after = _dir_size_bytes(base)
     delta = size_before - size_after

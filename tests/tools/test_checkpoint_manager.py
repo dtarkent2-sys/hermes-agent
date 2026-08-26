@@ -821,6 +821,96 @@ class TestPruneCheckpointsMissingHead:
         assert result["scanned"] == 0  # no orphan/stale workdir deletions
 
 
+class TestPruneColdStoreOrdering:
+    """Cold-store ordering regression (first-prune rc=128).
+
+    A prior ``git gc`` can remove the empty ``refs/`` / ``branches/`` dirs from
+    a bare store. On the NEXT maintenance pass the very first ``reflog expire``
+    and ``gc`` must not fatal with ``rc=128 not a git repository`` — the dirs
+    must be repaired *before* the first maintenance git command, not only
+    after. These tests reproduce that cold start.
+    """
+
+    def _bare_store_with_ref(self, tmp_path):
+        """Valid bare store with one project ref (so gc has real work)."""
+        base = tmp_path / "checkpoints"
+        store = base / "store"
+        store.mkdir(parents=True)
+        subprocess.run(["git", "init", "--bare", str(store)], check=True,
+                       capture_output=True, text=True)
+        work = tmp_path / "work"
+        work.mkdir()
+        subprocess.run(["git", "init"], cwd=work, check=True,
+                       capture_output=True, text=True)
+        (work / "f").write_text("x")
+        subprocess.run(["git", "add", "f"], cwd=work, check=True,
+                       capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=h@h", "-c", "user.name=h",
+             "commit", "-m", "i"],
+            cwd=work, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "push", str(store), "HEAD:refs/hermes/abc"],
+            cwd=work, check=True, capture_output=True, text=True,
+        )
+        return base, store
+
+    def test_first_prune_clean_when_refs_and_branches_missing(self, tmp_path, caplog):
+        """Starting from a store whose refs/ and branches/ were removed by a
+        prior GC, the FIRST prune must emit no git failures and return
+        cleanly — no second pass needed to recover.
+        """
+        base, store = self._bare_store_with_ref(tmp_path)
+
+        # Simulate a prior `git gc` having pruned the empty dirs.
+        for sub in ("refs", "branches"):
+            p = store / sub
+            if p.exists():
+                shutil.rmtree(p)
+        assert not (store / "refs").exists()
+        assert not (store / "branches").exists()
+
+        with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
+            result = prune_checkpoints(
+                retention_days=0, delete_orphans=False, checkpoint_base=base,
+            )
+
+        # No maintenance git command fataled (the two rc=128s QA observed).
+        assert not caplog.records, caplog.records
+        # Result must not claim a clean run while git actually failed.
+        assert result["errors"] == 0
+        # The store was repaired to a valid bare repo by the first pass itself.
+        assert (store / "refs" / "heads").is_dir()
+        assert (store / "branches").is_dir()
+
+    def test_maintenance_failure_counts_into_errors(self, tmp_path, monkeypatch):
+        """If the maintenance GC (reflog/gc) fails with rc=128 on a store that
+        repair cannot fix, that failure must be counted in result['errors'] so
+        the CLI cannot report 'Errors: 0' after a fatal.
+
+        We force the failure at the ``_run_git`` boundary (reflog/gc only)
+        rather than deleting a git-managed dir, which is racy on Windows.
+        """
+        base, _store = self._bare_store_with_ref(tmp_path)
+        import tools.checkpoint_manager as ckpt_mgr
+
+        real_run_git = ckpt_mgr._run_git
+
+        def flaky_run_git(args, *a, **k):
+            if args[:1] in (["reflog"], ["gc"]):
+                return False, "", "fatal: not a git repository"
+            return real_run_git(args, *a, **k)
+
+        monkeypatch.setattr(ckpt_mgr, "_run_git", flaky_run_git)
+
+        result = prune_checkpoints(
+            retention_days=0, delete_orphans=False, checkpoint_base=base,
+        )
+
+        assert result["errors"] >= 1
+
+
 class TestPruneCheckpointsV2:
     """v2 pruning walks the shared store's projects/ metadata."""
 
