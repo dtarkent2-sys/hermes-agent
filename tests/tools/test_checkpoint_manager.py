@@ -508,6 +508,30 @@ class TestGitEnvIsolation:
 
         assert ok, stderr
 
+    def test_bare_size_cap_maintenance_omits_worktree(self, tmp_path):
+        """The size-cap pass's reflog/gc must run bare (no GIT_WORK_TREE) just
+        like the ref-pruning GC, otherwise it fatals on a bare store."""
+        store = tmp_path / "store"
+        work = tmp_path / "work"
+        work.mkdir()
+        subprocess.run(["git", "init", "--bare", str(store)], check=True,
+                       capture_output=True, text=True)
+
+        # Reproduce the exact size-cap maintenance calls (previously defaulted
+        # to use_worktree=True and would fail once git refused to resolve a
+        # non-bare work tree against the bare GIT_DIR).
+        ok_reflog, _, err_reflog = _run_git(
+            ["reflog", "expire", "--expire=now", "--all"],
+            store, str(work), use_worktree=False,
+        )
+        ok_gc, _, err_gc = _run_git(
+            ["gc", "--prune=now", "--quiet"],
+            store, str(work), timeout=120, use_worktree=False,
+        )
+
+        assert ok_reflog, err_reflog
+        assert ok_gc, err_gc
+
 
 # =========================================================================
 # Error resilience
@@ -731,6 +755,70 @@ class TestPruneCheckpointsLegacy:
         assert result["deleted_orphan"] == 0
         assert orphan.exists()
         assert (base / "garbage-dir").exists()
+
+
+class TestPruneCheckpointsMissingHead:
+    """An existing store directory without HEAD is not a repo yet — prune
+    must skip all git maintenance cleanly (rc=0, no fatal) and must NOT
+    auto-initialize a git repository. _init_store alone owns deliberate
+    bare-store creation on actual checkpoint writes."""
+
+    def _bare_store(self, tmp_path):
+        base = tmp_path / "checkpoints"
+        store = base / "store"
+        store.mkdir(parents=True)
+        subprocess.run(["git", "init", "--bare", str(store)], check=True,
+                       capture_output=True, text=True)
+        return base
+
+    def test_prune_skips_git_maintenance_when_head_absent(self, tmp_path):
+        base = tmp_path / "checkpoints"
+        # An existing store dir with objects/ but no HEAD (e.g. interrupted init).
+        store = base / "store"
+        store.mkdir(parents=True)
+        (store / "objects").mkdir()
+
+        # Must run clean, not create a repo, and not fatal.
+        result = prune_checkpoints(
+            retention_days=0, delete_orphans=True, checkpoint_base=base,
+        )
+
+        assert result["errors"] == 0
+        assert result["scanned"] == 0
+        # No repo created, no HEAD synthesized.
+        assert not (store / "HEAD").exists()
+        assert not (store / "refs").exists()
+
+    def test_prune_runs_clean_on_valid_bare_store(self, tmp_path):
+        """Size-cap + ref-prune maintenance on a valid bare store must be a
+        no-op success (rc path returns 0), covering the previously-missed
+        size-cap gc callsite."""
+        base = self._bare_store(tmp_path)
+        # Seed a tiny bare store with a project ref so size-cap has something
+        # to inspect without erroring.
+        work = tmp_path / "work"
+        work.mkdir()
+        subprocess.run(["git", "init"], cwd=work, check=True,
+                       capture_output=True, text=True)
+        (work / "f").write_text("x")
+        subprocess.run(["git", "add", "f"], cwd=work, check=True,
+                       capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=h@h", "-c", "user.name=h",
+             "commit", "-m", "i"],
+            cwd=work, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "push", str(base / "store"), "HEAD:refs/hermes/abc"],
+            cwd=work, check=True, capture_output=True, text=True,
+        )
+
+        result = prune_checkpoints(
+            retention_days=0, delete_orphans=False, checkpoint_base=base,
+        )
+
+        assert result["errors"] == 0
+        assert result["scanned"] == 0  # no orphan/stale workdir deletions
 
 
 class TestPruneCheckpointsV2:

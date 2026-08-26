@@ -1963,11 +1963,11 @@ def prune_checkpoints(
                     break
             _run_git(
                 ["reflog", "expire", "--expire=now", "--all"],
-                store, str(base),
+                store, str(base), use_worktree=False,
             )
             _run_git(
                 ["gc", "--prune=now", "--quiet"],
-                store, str(base), timeout=_GIT_TIMEOUT * 3,
+                store, str(base), timeout=_GIT_TIMEOUT * 3, use_worktree=False,
             )
             _repair_bare_repo_dirs(store)
 
