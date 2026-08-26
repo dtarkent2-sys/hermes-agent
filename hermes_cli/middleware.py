@@ -34,6 +34,28 @@ VALID_MIDDLEWARE: set[str] = {
 }
 
 
+class MiddlewareRequestRefused(RuntimeError):
+    """Raised by request middleware to refuse dispatching the request.
+
+    This is the *explicit* "do not send this request" contract, as opposed to a
+    plugin bug. It carries an optional operator-facing report so the host can
+    surface something actionable instead of a bare provider 400.
+
+    Request middleware (``llm_request`` / ``tool_request``) raises this to stop
+    the dispatch entirely. The plugin manager MUST propagate it to the host (it
+    must NOT be swallowed like an ordinary middleware exception, which is what
+    let the safe_context refusal loop go unbound for minutes). The conversation
+    loop catches it and routes into bounded recovery (compress and re-dispatch,
+    or stop the turn after a cap of failed attempts) instead of blindly
+    retrying the same oversized request forever.
+    """
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.decision: Any = None
+
+
+
 @dataclass
 class RequestMiddlewareResult:
     """Result of applying request middleware to a mutable payload."""
