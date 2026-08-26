@@ -62,7 +62,11 @@ from hermes_constants import (
 from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get, load_config_readonly
-from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.middleware import (
+    OBSERVER_SCHEMA_VERSION,
+    VALID_MIDDLEWARE,
+    MiddlewareRequestRefused,
+)
 from hermes_cli.plugin_capabilities import (  # noqa: F401 — re-exported
     CAPABILITY_REGISTRY,
     VALID_CAPABILITY_IDS,
@@ -5426,6 +5430,14 @@ class PluginManager:
                 ret = cb(**kwargs)
                 if ret is not None:
                     results.append(ret)
+            except MiddlewareRequestRefused:
+                # An explicit, deliberate refusal to dispatch the request
+                # (e.g. safe_context's context-budget preflight). This is NOT
+                # a plugin bug and MUST reach the host: swallowing it is what
+                # let a refusal loop re-dispatch an oversized request for
+                # minutes while the transcript grew 60k -> 110k tokens. See
+                # MiddlewareRequestRefused in hermes_cli/middleware.py.
+                raise
             except Exception as exc:
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",

@@ -290,6 +290,26 @@ class TestPluginDiscovery:
         ]
         assert mgr.has_middleware("llm_request") is True
 
+    def test_middleware_request_refused_is_propagated_by_manager(self):
+        """PluginManager.invoke_middleware must not swallow a refusal.
+
+        Regression for the Aug 2026 safe_context refusal loop: the plugin
+        manager swallowed an explicit ``MiddlewareRequestRefused`` as an
+        ordinary middleware exception, so the conversation loop kept
+        dispatching an oversized prompt and the transcript grew 60k -> 110k
+        tokens. An explicit refusal is NOT a plugin bug — it must propagate.
+        """
+        from hermes_cli.middleware import MiddlewareRequestRefused
+
+        manager = PluginManager(scope_key="test-refused-propagate")
+        manager._middleware.setdefault("llm_request", []).append(
+            lambda **kw: (_ for _ in ()).throw(
+                MiddlewareRequestRefused("do not send")
+            )
+        )
+
+        with pytest.raises(MiddlewareRequestRefused, match="do not send"):
+            manager.invoke_middleware("llm_request", request={"messages": []})
 
     def test_middleware_helpers_skip_no_listener_work(self, monkeypatch):
         manager = types.SimpleNamespace(_middleware={})

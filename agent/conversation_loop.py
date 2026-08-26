@@ -47,6 +47,7 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
+from hermes_cli.middleware import MiddlewareRequestRefused
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -2866,6 +2867,20 @@ def run_conversation(
                     api_kwargs = _llm_request_mw.payload
                     _original_api_kwargs = _llm_request_mw.original_payload
                     _llm_middleware_trace = _llm_request_mw.trace
+                except MiddlewareRequestRefused:
+                    # An explicit request-middleware refusal (e.g. safe_context
+                    # deciding the assembled prompt physically cannot fit the
+                    # model's context window). The middleware has already
+                    # decided the request must NOT be dispatched — propagate to
+                    # the outer handler, which routes it into bounded
+                    # compression recovery (compress + re-dispatch up to
+                    # max_compression_attempts, then a terminal stop) rather
+                    # than re-sending the identical oversized prompt. This is
+                    # the exact path that was swallowed by the bare except
+                    # below (and by plugins.invoke_middleware), letting the
+                    # refusal loop spin for minutes while the transcript grew
+                    # 60k -> 110k tokens.
+                    raise
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
@@ -4297,6 +4312,150 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                # ── Request-middleware refusal (bounded recovery) ─────
+                # An explicit refusal to dispatch (safe_context preflight
+                # decided the assembled prompt physically cannot fit the
+                # model's context window). This is NOT a provider error and
+                # NOT a plugin bug — it means "do not send this request". We
+                # must NOT re-dispatch the identical oversized prompt: that is
+                # the exact unbounded loop the incident logged (safe_context
+                # refused every turn while the transcript grew 60k -> 110k
+                # tokens). Recovery is the same bounded path as a provider
+                # 413: compress history and re-dispatch, up to
+                # max_compression_attempts; if compression cannot make the
+                # request fit, end the turn as a terminal failure rather than
+                # spinning.
+                if isinstance(api_error, MiddlewareRequestRefused):
+                    compression_attempts += 1
+                    if compression_attempts > max_compression_attempts:
+                        # Terminal — surface the operator-facing report from
+                        # the middleware so the user knows why nothing was
+                        # sent, then stop the turn.
+                        _flush_status_buffer = getattr(
+                            agent, "_flush_status_buffer", None
+                        )
+                        if callable(_flush_status_buffer):
+                            _flush_status_buffer()
+                        _report = str(api_error)
+                        agent._vprint(
+                            f"{agent.log_prefix}❌ Request refused by middleware "
+                            f"and compression failed after {max_compression_attempts} "
+                            f"attempts.",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 Try /new to start a fresh "
+                            f"conversation, or /compress to retry compression.",
+                            force=True,
+                        )
+                        logger.error(
+                            "%sMiddleware request refusal after %d compression "
+                            "attempts: %s",
+                            agent.log_prefix, max_compression_attempts, _report,
+                        )
+                        agent._persist_session(messages, conversation_history)
+                        _final_response = (
+                            "The request was refused because it exceeds the "
+                            "model's context limit, and compression could not "
+                            "reduce it. Try /new to start a fresh conversation "
+                            "or /compress."
+                        )
+                        return {
+                            "final_response": _final_response,
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": _final_response,
+                            "partial": True,
+                            "failed": True,
+                            "compression_exhausted": True,
+                        }
+                    agent._buffer_status(
+                        f"⚠️  Request refused by middleware (context limit) — "
+                        f"compression attempt "
+                        f"{compression_attempts}/{max_compression_attempts}..."
+                    )
+                    original_len = len(messages)
+                    original_tokens = estimate_messages_tokens_rough(messages)
+                    _overflow_input = messages
+                    messages, active_system_prompt = agent._compress_context(
+                        messages,
+                        system_message,
+                        approx_tokens=estimate_request_tokens_rough(
+                            api_messages, tools=agent.tools or None
+                        ),
+                        task_id=effective_task_id,
+                    )
+                    if (
+                        messages is _overflow_input
+                        and compression_skipped_due_to_lock(agent)
+                    ):
+                        # #69870 lock-skip: another path holds the session's
+                        # compression lock, so this pass no-oped. Temporary
+                        # defer, not exhaustion — refund and end softly so the
+                        # gateway does NOT auto-reset the session.
+                        compression_attempts -= 1
+                        agent._persist_session(messages, conversation_history)
+                        return _compression_deferred_result(
+                            agent, messages, api_call_count
+                        )
+                    conversation_history = conversation_history_after_compression(
+                        agent, messages, conversation_history
+                    )
+                    new_tokens = estimate_messages_tokens_rough(messages)
+                    approx_tokens = new_tokens
+                    if len(messages) < original_len or (
+                        new_tokens > 0 and new_tokens < original_tokens * 0.95
+                    ):
+                        if len(messages) < original_len:
+                            agent._buffer_status(
+                                COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(
+                                    before=original_len, after=len(messages)
+                                )
+                            )
+                        else:
+                            agent._buffer_status(
+                                COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(
+                                    before=original_tokens, after=new_tokens
+                                )
+                            )
+                        time.sleep(2)
+                        _retry.restart_with_compressed_messages = True
+                        break
+                    # Compression could not shrink it below the refusal
+                    # threshold — fall through to the terminal stop below.
+                    agent._flush_status_buffer()
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Request refused and cannot compress "
+                        f"further.",
+                        force=True,
+                    )
+                    agent._vprint(
+                        f"{agent.log_prefix}   💡 Try /new to start a fresh "
+                        f"conversation, or /compress to retry compression.",
+                        force=True,
+                    )
+                    logger.error(
+                        "%sMiddleware request refusal cannot compress further.",
+                        agent.log_prefix,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    _final_response = (
+                        "The request was refused because it exceeds the "
+                        "model's context limit and cannot be compressed "
+                        "further. Try /new to start a fresh conversation."
+                    )
+                    return {
+                        "final_response": _final_response,
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count,
+                        "error": _final_response,
+                        "partial": True,
+                        "failed": True,
+                        "compression_exhausted": True,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
