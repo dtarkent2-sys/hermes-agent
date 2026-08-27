@@ -1,4 +1,12 @@
-"""Shared fixtures for tests/acp.
+"""Shared fixtures for tests/acp_suite.
+
+NOTE: this directory is deliberately named ``acp_suite`` (not ``acp``) so it
+can never shadow the real site-packages ``acp`` wheel. With an ``__init__.py``
+present, pytest makes it importable as a top-level package whenever an earlier
+test leaves ``<repo>/tests`` on ``sys.path`` — a directory named ``acp`` here
+turned the first mid-sweep ``import acp`` into the stub package (no
+``acp.schema`` submodule) and poisoned ``sys.modules['acp']`` for the rest of
+the run. See kanban t_61cba781.
 
 Keeps the ACP server tests offline: ``HermesACPAgent._build_model_state``
 calls ``hermes_cli.inventory.build_models_payload``, which (without this
