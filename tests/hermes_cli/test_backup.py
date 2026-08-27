@@ -1014,9 +1014,11 @@ class TestProfileRestoration:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        # Only valid profile should get a wrapper
-        assert (wrapper_dir / "valid").exists()
-        assert not (wrapper_dir / "empty").exists()
+        # Only valid profile should get a wrapper. create_wrapper_script()
+        # names it <alias>.bat on Windows, extensionless on POSIX.
+        ext = ".bat" if os.name == "nt" else ""
+        assert (wrapper_dir / f"valid{ext}").exists()
+        assert not (wrapper_dir / f"empty{ext}").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1707,8 +1709,11 @@ class TestMemoryProviderExternalPaths:
         restored = dst_home / ".honcho" / "config.json"
         assert restored.exists()
         assert restored.read_text() == '{"peer":"bob"}'
-        # Credential-shaped file tightened.
-        assert (restored.stat().st_mode & 0o777) == 0o600
+        # Credential-shaped file tightened. POSIX only: Windows os.chmod
+        # cannot express 0600 (st_mode & 0o777 stays 0o666), and the chmod
+        # in backup.py is best-effort there.
+        if os.name == "posix":
+            assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
 
