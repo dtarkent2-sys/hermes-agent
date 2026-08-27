@@ -21,9 +21,10 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # No sys.modules purge: kanban paths resolve HERMES_HOME per call
+    # (kanban_home() re-reads the env; the root memo is env-keyed), so a
+    # purge adds nothing — and it forks module identity against every
+    # other test file's import-time bindings, breaking them in a sweep.
     from hermes_cli import kanban_db
     yield kanban_db
 

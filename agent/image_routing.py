@@ -63,10 +63,11 @@ _IMAGE_EXTS = (
 _IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
 
 # Absolute / home-relative local image path. Matches the same shape gateway's
-# extract_local_files() uses: anchors to ``~/`` or ``/``, ignores matches inside
-# URLs (the ``(?<![/:\w.])`` lookbehind), and case-insensitive on the extension.
+# extract_local_files() uses: anchors to ``~/``, ``/``, or a Windows drive
+# letter (``C:/`` or ``C:\``, #34632), ignores matches inside URLs (the
+# ``(?<![/:\w.])`` lookbehind), and case-insensitive on the extension.
 _LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
+    r"(?<![/:\w.])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
     re.IGNORECASE,
 )
 

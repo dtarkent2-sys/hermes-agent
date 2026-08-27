@@ -300,11 +300,17 @@ class TestExtractImageRefs:
 
     def test_finds_home_relative_path(self, tmp_path: Path, monkeypatch):
         # Simulate ~/foo.png by pointing HOME at tmp_path and creating the file
+        # USERPROFILE too: ntpath.expanduser (Windows) reads USERPROFILE and
+        # ignores HOME, so patching only HOME never redirects ~/ there.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         img = tmp_path / "foo.png"
         img.write_bytes(_png_bytes())
         paths, urls = extract_image_refs("see ~/foo.png please")
-        assert paths == [str(img)]
+        # expanduser concatenates the USERPROFILE value with a literal
+        # '/', so on Windows the match is mixed-separator; compare with
+        # normalized separators rather than str(img).
+        assert [p.replace('\\', '/') for p in paths] == [str(img).replace('\\', '/')]
         assert urls == []
 
 

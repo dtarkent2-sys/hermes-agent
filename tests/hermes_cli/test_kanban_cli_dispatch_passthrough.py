@@ -23,9 +23,10 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # No sys.modules purge: kanban paths resolve HERMES_HOME per call
+    # (kanban_home() re-reads the env; the root memo is env-keyed), so a
+    # purge adds nothing — and it forks module identity against every
+    # other test file's import-time bindings, breaking them in a sweep.
     yield test_home
 
 
