@@ -789,6 +789,37 @@ class TestPruneCheckpointsMissingHead:
         assert not (store / "HEAD").exists()
         assert not (store / "refs").exists()
 
+    def test_prune_skips_git_maintenance_when_store_not_git_repo(self, tmp_path, caplog):
+        """A store dir that has a HEAD file but is NOT a git repository
+        (no ``config`` — e.g. a hand-made or corrupted dir) must be skipped
+        by maintenance with rc=0 semantics: no git command issued, no ERROR
+        log, an informational skip line instead, and a clean result dict."""
+        base = tmp_path / "checkpoints"
+        store = base / "store"
+        store.mkdir(parents=True)
+        # Mimic the reported state: dir exists, has HEAD, but no config/
+        # objects/refs — not a git repository in any sense.
+        (store / "HEAD").write_text("ref: refs/heads/master\n", encoding="utf-8")
+
+        with caplog.at_level(logging.INFO, logger="tools.checkpoint_manager"):
+            result = prune_checkpoints(
+                retention_days=0, delete_orphans=True, checkpoint_base=base,
+            )
+
+        # No maintenance failure surfaced.
+        assert result["errors"] == 0
+        # No git command fataled; the skip is informational, not an error.
+        assert not any(
+            r.levelno >= logging.ERROR for r in caplog.records
+        ), caplog.records
+        assert any(
+            "Skipping checkpoint store maintenance" in r.getMessage()
+            for r in caplog.records
+        )
+        # Repo was not synthesized.
+        assert not (store / "config").exists()
+        assert not (store / "refs").exists()
+
     def test_prune_runs_clean_on_valid_bare_store(self, tmp_path):
         """Size-cap + ref-prune maintenance on a valid bare store must be a
         no-op success (rc path returns 0), covering the previously-missed

@@ -356,6 +356,21 @@ def _repair_bare_repo_dirs(store: Path) -> None:
                 )
 
 
+def _store_gc_applicable(store: Path) -> bool:
+    """Return True if ``store`` can plausibly hold a bare git repository.
+
+    Maintenance (``reflog expire`` / ``gc``) is only issued when the store
+    looks like one of our bare shadow stores: it has a ``HEAD`` (as the
+    existing prune guard requires) AND a ``config`` file (as created by
+    ``git init --bare`` / ``_init_store``).  A plain directory — or a
+    directory whose ``HEAD`` is unrelated — fails the probe and is skipped
+    cleanly instead of fatalling with ``rc=128 fatal: not a git
+    repository``.  Both files are owned by the store layout, so this probe
+    never mutates anything and never synthesizes a repository.
+    """
+    return (store / "HEAD").is_file() and (store / "config").is_file()
+
+
 def _run_store_gc(store: Path, working_dir: str) -> int:
     """Run bare-store maintenance GC (``reflog expire`` + ``gc``).
 
@@ -368,11 +383,22 @@ def _run_store_gc(store: Path, working_dir: str) -> int:
     succeed; the post-GC repair is preserved because ``git gc`` can remove
     the empty dirs again within the same call.
 
+    If the store is not a bare git repository (missing ``HEAD`` or
+    ``config``), no git command is issued at all: maintenance is skipped
+    with a single informational log line and 0 failures reported, so a
+    non-git store can never produce an ``rc=128`` fatal.
+
     All commands run bare (``use_worktree=False``) against the shared store.
     Returns the number of maintenance git commands that failed (0, 1, or 2)
     so a caller can surface a real error count instead of reporting a clean
     run after an ``rc=128``.
     """
+    if not _store_gc_applicable(store):
+        logger.info(
+            "Skipping checkpoint store maintenance: %s is not a bare "
+            "git repository (missing HEAD or config)", store,
+        )
+        return 0
     _repair_bare_repo_dirs(store)
     failures = 0
     ok_reflog, _, _ = _run_git(
