@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
+    file_uri_to_local_path,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -654,7 +655,6 @@ class MattermostAdapter(BasePlatformAdapter):
 
         import mimetypes
         import aiohttp
-        from urllib.parse import unquote as _unquote
 
         CHUNK = 5  # Mattermost post file_ids cap
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
@@ -671,7 +671,7 @@ class MattermostAdapter(BasePlatformAdapter):
                         caption_parts.append(alt_text)
 
                     if image_url.startswith("file://"):
-                        local_path = _unquote(image_url[7:])
+                        local_path = file_uri_to_local_path(image_url)
                         p = Path(local_path)
                         if not p.exists():
                             logger.warning("Mattermost: skipping missing image %s", local_path)

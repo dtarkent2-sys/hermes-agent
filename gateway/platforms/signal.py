@@ -26,12 +26,13 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 import httpx
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    file_uri_to_local_path,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -1206,7 +1207,7 @@ class SignalAdapter(BasePlatformAdapter):
         skipped_oversize = 0
         for image_url, _alt_text in images:
             if image_url.startswith("file://"):
-                file_path = unquote(image_url[7:])
+                file_path = file_uri_to_local_path(image_url)
             else:
                 try:
                     file_path = await cache_image_from_url(image_url)
@@ -1376,7 +1377,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Resolve image to local path
         if image_url.startswith("file://"):
-            file_path = unquote(image_url[7:])
+            file_path = file_uri_to_local_path(image_url)
         else:
             # Download remote image to cache
             try:

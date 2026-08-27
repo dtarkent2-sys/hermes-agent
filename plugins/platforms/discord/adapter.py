@@ -149,6 +149,7 @@ from gateway.platforms.helpers import (
 )
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
+    file_uri_to_local_path,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -4048,7 +4049,6 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import discord as _discord_mod
             import io as _io
-            from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
@@ -4080,7 +4080,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     if alt_text:
                         captions.append(alt_text)
                     if image_url.startswith("file://"):
-                        local_path = _unquote(image_url[7:])
+                        local_path = file_uri_to_local_path(image_url)
                         if not os.path.exists(local_path):
                             logger.warning("[%s] Skipping missing image: %s", self.name, local_path)
                             continue

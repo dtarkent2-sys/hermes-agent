@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.platforms.base import (
+    file_uri_to_local_path,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -1235,7 +1236,6 @@ class EmailAdapter(BasePlatformAdapter):
         if not images:
             return
 
-        from urllib.parse import unquote as _unquote
 
         body_parts: List[str] = []
         local_paths: List[str] = []
@@ -1243,7 +1243,7 @@ class EmailAdapter(BasePlatformAdapter):
             if alt_text:
                 body_parts.append(alt_text)
             if image_url.startswith("file://"):
-                local_path = _unquote(image_url[7:])
+                local_path = file_uri_to_local_path(image_url)
                 if Path(local_path).exists():
                     local_paths.append(local_path)
                 else:

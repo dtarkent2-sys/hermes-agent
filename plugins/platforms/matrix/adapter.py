@@ -136,6 +136,7 @@ from gateway.platforms.base import (
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
     _ssrf_redirect_guard,
+    file_uri_to_local_path,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
 
@@ -2535,7 +2536,6 @@ class MatrixAdapter(BasePlatformAdapter):
         """Send multiple Matrix images as one ordered logical batch."""
         if not images:
             return
-        from urllib.parse import unquote as _unquote
 
         total = len(images)
         for idx, (image_url, alt_text) in enumerate(images, start=1):
@@ -2547,7 +2547,7 @@ class MatrixAdapter(BasePlatformAdapter):
             if image_url.startswith("file://"):
                 result = await self.send_image_file(
                     chat_id=chat_id,
-                    image_path=_unquote(image_url[7:]),
+                    image_path=file_uri_to_local_path(image_url),
                     caption=caption,
                     metadata=metadata,
                 )

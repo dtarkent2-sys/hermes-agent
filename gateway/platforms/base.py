@@ -1681,6 +1681,71 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     return translated
 
 
+def local_path_to_file_uri(path: str) -> str:
+    """Canonical ``file://`` URI for a local media path (``Path.as_uri()``).
+
+    Producers of native image batches emit this form: ``file:///C:/a/b.png``
+    on Windows, ``file:///home/a/b.png`` on POSIX. Replaces the historical
+    ``f"file://{quote(p)}"`` form, which on Windows percent-encoded the drive
+    colon and separators (``file://C%3A%5CUsers%5C...``) — non-canonical, and
+    unreadable for consumers that strip the scheme without percent-decoding.
+    Relative paths are resolved against the CWD as a last resort so this
+    never raises where the old producer emitted a (broken) URI.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(os.path.abspath(str(path)))
+    return p.as_uri()
+
+
+def file_uri_to_local_path(uri: str) -> str:
+    """Decode a ``file://`` URI into a local filesystem path.
+
+    Tolerant of every form the codebase has ever emitted and tests pin:
+
+    - canonical ``Path.as_uri()`` output — ``file:///C:/Users/x.png``
+      (Windows), ``file:///home/x.png`` (POSIX), ``file://server/share/x.png``
+      (UNC)
+    - the historical quoted producer form — ``file://C%3A%5CUsers%5Cx.png``
+    - bare unquoted paths after the scheme — ``file://C:\\Users\\x.png``,
+      ``file://C:/Users/x.png``
+
+    Consumers must call this instead of hand-slicing ``uri[7:]``: the
+    canonical Windows form puts the drive below a leading slash, and a bare
+    slice yields a path-absolute ``/C:/...`` that Windows ``Path`` resolves
+    as ``\\C:\\...`` — a file that never exists.
+    """
+    from urllib.parse import unquote as _unquote, urlsplit as _urlsplit
+
+    try:
+        parts = _urlsplit(uri)
+    except ValueError:
+        return _unquote(uri[7:]) if uri.startswith("file://") else uri
+
+    host = _unquote(parts.netloc or "")
+    path = _unquote(parts.path or "")
+
+    if host and host.lower() != "localhost":
+        if len(host) == 2 and host[1] == ":" and path:
+            return host + path  # bare drive form: file://C:/Users/x.png
+        if "\\" in host or (len(host) >= 2 and host[1] == ":"):
+            # A Windows path (or its leading chunk) landed in the netloc
+            # slot — ``file://C:\dir\img.png`` or
+            # ``file://C:\dir\name/extra.png`` (urlsplit cuts the netloc at
+            # the first ``/``). Rejoin the remainder instead of dropping it.
+            return host + path
+        return "//" + host + path  # real UNC authority: //server/share/x
+    if (
+        len(path) >= 3
+        and path[0] == "/"
+        and path[1].isascii()
+        and path[1].isalpha()
+        and path[2] == ":"
+    ):
+        return path[1:]  # canonical drive form: /C:/... -> C:/...
+    return path
+
+
 def validate_media_delivery_path(path: str) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
@@ -4414,7 +4479,6 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to bundle into a single native API call
         (e.g. Signal's multi-attachment RPC)
         """
-        from urllib.parse import unquote as _unquote
 
         for image_url, alt_text in images:
             if human_delay > 0:
@@ -4429,7 +4493,7 @@ class BasePlatformAdapter(ABC):
                 if image_url.startswith("file://"):
                     img_result = await self.send_image_file(
                         chat_id=chat_id,
-                        image_path=_unquote(image_url[7:]),
+                        image_path=file_uri_to_local_path(image_url),
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
@@ -6672,7 +6736,6 @@ class BasePlatformAdapter(ABC):
                 # files skip the photo path and route to send_document below
                 # so they're delivered with original bytes (no Telegram
                 # sendPhoto recompression).
-                from urllib.parse import quote as _quote
                 _image_paths: list = []
                 _non_image_media: list = []
                 for media_path, is_voice in media_files:
@@ -6693,7 +6756,7 @@ class BasePlatformAdapter(ABC):
 
                 if _image_paths:
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                        _batch = [(local_path_to_file_uri(p), "") for p in _image_paths]
                         await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,

@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Optional
 # external dependency that would block the plugin from loading.
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    file_uri_to_local_path,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -1006,10 +1007,9 @@ class SimplexAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send an image. Supports ``file://`` URLs and ``http(s)://`` URLs."""
-        from urllib.parse import unquote
 
         if image_url.startswith("file://"):
-            file_path = unquote(image_url[7:])
+            file_path = file_uri_to_local_path(image_url)
         else:
             try:
                 from gateway.platforms.base import cache_image_from_url

@@ -58,6 +58,7 @@ except ImportError:  # pragma: no cover - dependency gate
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, greedy_pack_blocks
 from gateway.platforms.base import (
+    file_uri_to_local_path,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -2058,7 +2059,7 @@ class WeixinAdapter(BasePlatformAdapter):
             file_path = await self._download_remote_media(image_url)
             cleanup = True
         else:
-            file_path = image_url.replace("file://", "")
+            file_path = file_uri_to_local_path(image_url)
             if not os.path.isabs(file_path):
                 file_path = os.path.abspath(file_path)
             cleanup = False

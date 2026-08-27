@@ -1136,7 +1136,7 @@ class GatewayKanbanWatchersMixin:
         if not candidates:
             return
 
-        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.platforms.base import BasePlatformAdapter, local_path_to_file_uri
         candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
         if not candidates:
             return
@@ -1144,7 +1144,6 @@ class GatewayKanbanWatchersMixin:
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 
-        from urllib.parse import quote as _quote
 
         # Partition images so they ride a single send_multiple_images call
         # on platforms that support batch image uploads (Signal/Slack RPCs).
@@ -1153,7 +1152,7 @@ class GatewayKanbanWatchersMixin:
 
         if image_paths:
             try:
-                batch = [(f"file://{_quote(p)}", "") for p in image_paths]
+                batch = [(local_path_to_file_uri(p), "") for p in image_paths]
                 await adapter.send_multiple_images(
                     chat_id=chat_id, images=batch, metadata=metadata,
                 )

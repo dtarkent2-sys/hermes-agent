@@ -44,6 +44,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    file_uri_to_local_path,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -3748,7 +3749,6 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id, team_id=self._metadata_team_id(metadata)
         )
         try:
-            from urllib.parse import unquote as _unquote
             from gateway.platforms.base import _ssrf_redirect_guard
             from tools.url_safety import (
                 create_ssrf_safe_async_client,
@@ -3780,7 +3780,7 @@ class SlackAdapter(BasePlatformAdapter):
                             initial_comment_parts.append(alt_text)
 
                         if image_url.startswith("file://"):
-                            local_path = _unquote(image_url[7:])
+                            local_path = file_uri_to_local_path(image_url)
                             if not os.path.exists(local_path):
                                 logger.warning(
                                     "[Slack] Skipping missing image: %s", local_path

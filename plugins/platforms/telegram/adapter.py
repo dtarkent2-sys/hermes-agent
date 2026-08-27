@@ -282,6 +282,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    file_uri_to_local_path,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -7746,7 +7747,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if not photos:
             return
 
-        from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
 
         # Chunk into groups of 10 (Telegram's album limit)
@@ -7763,7 +7763,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 for image_url, alt_text in chunk:
                     caption = alt_text[:1024] if alt_text else None
                     if image_url.startswith("file://"):
-                        local_path = _unquote(image_url[7:])
+                        local_path = file_uri_to_local_path(image_url)
                         if not os.path.exists(local_path):
                             logger.warning(
                                 "[%s] Skipping missing image in media group: %s",
