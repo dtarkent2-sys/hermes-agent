@@ -11328,6 +11328,52 @@ def cmd_dashboard(args):
             # Best-effort: if root resolution fails, fall back to the prior
             # behaviour (drop HERMES_HOME) rather than block the reroute.
             env.pop("HERMES_HOME", None)
+        # Test-isolation spawn gate (see the live-system guard in
+        # hermes_state.py, #82770).  This child is pinned to a machine root
+        # (HERMES_HOME above) — under POSIX execvpe that danger is transient
+        # (the exec'd image replaces the test process), but under Windows the
+        # "re-exec" is CreateProcess + wait: the child is a REAL second Hermes
+        # process that outlives its test, binds the port, and opens the live
+        # DB for as long as it survives (2026-08-27: a pytest dashboard child
+        # polled /api/sessions against production once a minute for hours).
+        # Refuse the spawn when the pinned home is a REAL production root and
+        # the parent is a pytest-context process — the exact combination the
+        # SessionDB live-system guard raises on.  Hermetic spawns (pinned to a
+        # tmp root, as in test_named_profile_reroute_defers_limit_to_final_
+        # process) are unaffected, so the gate is co-extensive with the DB
+        # guard rather than broader.  A test that genuinely needs the real
+        # production-pinned spawn opts in via HERMES_STATE_DB_GUARD_BYPASS=1
+        # (the same opt-out the SessionDB guard documents) or monkeypatches
+        # hermes_state.running_in_test_context.
+        import hermes_state as _hermes_state
+
+        _pinned_home = env.get("HERMES_HOME")
+        _pinned_is_prod = False
+        if _pinned_home:
+            try:
+                _resolved = Path(_pinned_home).expanduser().resolve()
+                for _root in _hermes_state._production_state_roots():
+                    if _resolved == _root or _resolved.parent == _root:
+                        _pinned_is_prod = True
+                        break
+            except Exception:
+                _pinned_is_prod = False
+        if (
+            _pinned_is_prod
+            and _hermes_state.running_in_test_context()
+            and not getattr(_hermes_state, "_STATE_DB_GUARD_BYPASS", False)
+            and not os.getenv(_hermes_state._STATE_DB_GUARD_BYPASS_ENV)
+        ):
+            raise SystemExit(
+                "refusing to spawn the production-pinned machine dashboard "
+                f"from a pytest context: child HERMES_HOME={_pinned_home!r} "
+                f"(production root). On Windows this 're-exec' is a real child "
+                "process that would outlive the test and open the live "
+                "state.db. Export HERMES_STATE_DB_GUARD_BYPASS=1 in the test "
+                "environment to opt in, or monkeypatch "
+                "hermes_state.running_in_test_context."
+            )
+
         # On Windows, os.execvpe() does not truly replace the process — it
         # spawns via CreateProcess then the parent exits.  Under Python 3.14+
         # this can crash with STATUS_ACCESS_VIOLATION (0xC0000005) when

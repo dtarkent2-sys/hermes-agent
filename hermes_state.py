@@ -563,6 +563,12 @@ def _in_test_context() -> bool:
     return _has_pytest_ancestor()
 
 
+#: Public seam for spawn gates outside this module (e.g. the machine-dashboard
+#: re-exec in ``hermes_cli.main``): same answer as :func:`_in_test_context`,
+#: exposed under a stable name so callers never import a private helper.
+running_in_test_context = _in_test_context
+
+
 def _production_state_roots() -> List[Path]:
     roots: List[Path] = []
     real_root = _real_platform_state_root()

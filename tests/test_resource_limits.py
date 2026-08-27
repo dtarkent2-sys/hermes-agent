@@ -290,6 +290,11 @@ def test_named_profile_reroute_defers_limit_to_final_process(monkeypatch, tmp_pa
         raise _ExecCalled
 
     monkeypatch.setattr(cli_main.os, "execvpe", stop_at_exec)
+    # Pin the POSIX exec branch: on win32 cmd_dashboard takes the real
+    # subprocess.Popen path (which this test's execvpe patch never intercepts
+    # — the original Windows failure mode), and the exec interface is what
+    # this test asserts on.
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
 
     args = SimpleNamespace(
         status=False,
