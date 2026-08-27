@@ -129,8 +129,11 @@ class TestCreateProfile:
             line.startswith("#") or not line.strip()
             for line in content.splitlines()
         )
-        mode = stat.S_IMODE(env_path.stat().st_mode)
-        assert mode == 0o600
+        # POSIX only: Windows os.chmod cannot express 0600 (the file stays
+        # 0o666) and the seed's chmod is best-effort there. The existence and
+        # placeholder-only content assertions above still run on Windows.
+        if os.name == "posix":
+            assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
 
 
@@ -232,7 +235,10 @@ class TestBackfillProfileEnvs:
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
             assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
-            assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
+            # POSIX only: Windows os.chmod cannot express 0600 (the file
+            # stays 0o666) and backfill's chmod is best-effort there.
+            if os.name == "posix":
+                assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
 
 
     def test_placeholder_when_default_has_no_env(self, profile_env):
@@ -570,6 +576,10 @@ class TestAliasCollision:
 class TestWrapperScript:
     """Tests for create_wrapper_script() and remove_wrapper_script()."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX wrapper branch; the Windows .bat branch is covered below",
+    )
     def test_creates_sh_on_posix(self, profile_env, monkeypatch):
         monkeypatch.setattr("hermes_cli.profiles.shutil.which", lambda name: "/opt/hermes/bin/hermes")
         from hermes_cli.profiles import create_wrapper_script
@@ -579,6 +589,16 @@ class TestWrapperScript:
         content = wrapper.read_text()
         assert content.startswith("#!/bin/sh")
         assert "exec /opt/hermes/bin/hermes -p mybot" in content
+
+    @pytest.mark.windows_only
+    def test_creates_bat_on_windows(self, profile_env):
+        """create_wrapper_script() writes a .bat launcher on win32."""
+        wrapper = create_wrapper_script("mybot")
+        assert wrapper is not None
+        assert wrapper.name == "mybot.bat"
+        content = wrapper.read_text()
+        assert content.startswith("@echo off")
+        assert "hermes -p mybot" in content
 
 
     @pytest.mark.windows_only
@@ -655,7 +675,10 @@ class TestFindAliasForProfile:
         info = next(p for p in list_profiles() if p.name == "steve")
         assert info.alias_name == "qiaobusi"
         assert info.alias_path is not None
-        assert info.alias_path.name == "qiaobusi"
+        # The wrapper file carries a .bat extension on Windows; the alias
+        # NAME stays bare (it's the command the user types either way).
+        ext = ".bat" if os.name == "nt" else ""
+        assert info.alias_path.name == f"qiaobusi{ext}"
 
 
 # ===================================================================
