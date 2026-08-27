@@ -812,6 +812,7 @@ prompt_caching:
 #     enabled: true            # false = skip automatic forks (/refine still works)
 #     provider: "auto"         # or pin a cheaper model (see memory.md)
 #     model: ""
+#     max_iterations: 4        # tool-iteration cap per fork (refusal loops burn less)
 
 # =============================================================================
 # Persistent Memory

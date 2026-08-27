@@ -1191,10 +1191,15 @@ DEFAULT_CONFIG = {
         # identical, skill near-identical in benchmarks).
         "background_review": {
             # Master switch for automatic post-turn memory/skill review forks.
-            # false = skip automatic spawns (manual /refine still works).
+            # false = skip automatic forks (manual /refine still works).
             "enabled": True,
             "provider": "auto",
             "model": "",
+            # Tool-calling iterations per review fork. 4 covers a legitimate
+            # load→write→confirm sequence; a run stuck retrying refused calls
+            # (each retry re-sends the whole replayed history to the provider)
+            # stops after 4 instead of burning ~16 cold replays.
+            "max_iterations": 4,
             "base_url": "",
             "api_key": "",
             "timeout": 120,

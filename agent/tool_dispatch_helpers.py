@@ -565,6 +565,15 @@ def make_tool_result_message(
         "content": wrapped,
         "tool_call_id": tool_call_id,
     })
+    # Background-review circuit breaker: every executor path (sequential,
+    # concurrent, managed) funnels tool results through here, so one hook
+    # covers all of them. No-op outside a review fork (one ContextVar lookup).
+    try:
+        from agent.background_review_breaker import observe_tool_result
+
+        observe_tool_result(name, wrapped)
+    except Exception:
+        pass
     try:
         risk_metadata = _tool_output_risk_metadata(name, content)
     except Exception as exc:

@@ -317,6 +317,30 @@ identical and skill capture near-identical to the main-model review.
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
 
+### Cost controls: iterations and cold-cache replay
+
+Two more knobs bound the review's token footprint:
+
+- `max_iterations` (default **4**) caps the fork's tool-calling
+  iterations. A legitimate review fits easily (load file → write →
+  confirm); a run stuck retrying refused calls stops after 4 replays
+  instead of burning a dozen. Raise it only if you routinely see reviews
+  that need more turns.
+- The fork replays the **full conversation** only when it can actually hit
+  a warm prompt cache (same model AND your provider reports cache reads).
+  If the provider never returns cache activity — some OpenAI-compatible
+  gateways don't — the fork automatically falls back to the compact
+  digest, because a full replay there would re-send the entire transcript
+  cold on every single iteration. No configuration needed; the behavior
+  follows what the provider actually reports.
+
+Additionally, a **refusal circuit breaker** watches each review run: if the
+curator guards refuse the same kind of write repeatedly (a retry loop), the
+run is aborted after a couple of refusals instead of continuing to the
+iteration cap. Refusal messages already tell the model how to proceed — a
+run that keeps tripping them is stuck, and every extra iteration is pure
+cost.
+
 ### Disabling automatic reviews (`enabled`)
 
 The review fork can burn a meaningful share of total tokens on busy hosts.

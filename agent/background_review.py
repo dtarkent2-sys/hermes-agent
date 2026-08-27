@@ -44,8 +44,37 @@ logger = logging.getLogger(__name__)
 # digest. That's the whole policy.
 # ---------------------------------------------------------------------------
 
-# Historical hardcoded iteration budget for the review fork.
+# Historical hardcoded iteration budget for the review fork. Still the
+# fallback when ``auxiliary.background_review.max_iterations`` is unset, but
+# the default knob now ships 4 — a curator run that is making legitimate
+# progress (load file → write file → confirm) fits easily, and a run stuck
+# retrying refused calls stops after 4 cold replays instead of 16.
 _REVIEW_MAX_ITERATIONS = 16
+_DEFAULT_REVIEW_MAX_ITERATIONS = 4
+
+
+def _resolve_review_max_iterations(task_cfg: Optional[Dict[str, Any]] = None) -> int:
+    """Resolve the review fork's iteration budget from config.
+
+    ``auxiliary.background_review.max_iterations`` (default 4, minimum 1);
+    falls back to the historical 16 when the config value is invalid.
+    """
+    try:
+        cfg = _background_review_task_config(task_cfg)
+        raw = cfg.get("max_iterations")
+        if raw is None:
+            return _DEFAULT_REVIEW_MAX_ITERATIONS
+        value = int(raw)
+        if value >= 1:
+            return value
+    except (TypeError, ValueError):
+        pass
+    except Exception:
+        logger.debug(
+            "background_review.max_iterations read failed; using default",
+            exc_info=True,
+        )
+    return _REVIEW_MAX_ITERATIONS
 
 
 def _background_review_task_config(
@@ -197,7 +226,9 @@ def _msg_text(m: Dict) -> str:
     return ""
 
 
-def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]:
+def _digest_history(
+    messages_snapshot: List[Dict], tail: int = 24, max_old_lines: Optional[int] = None
+) -> List[Dict]:
     """Compact replay for the routed (different-model) path only.
 
     Keeps the recent ``tail`` messages verbatim, collapses older turns into one
@@ -230,6 +261,16 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
                 lines.append(f"ASSISTANT[tools: {', '.join(names)}]")
             if text:
                 lines.append(f"ASSISTANT: {text[:200]}")
+    if max_old_lines is not None and len(lines) > max(1, max_old_lines):
+        # Hard bound for the no-cache path: keep the MOST RECENT max_old_lines
+        # digest lines and note the dropped head count, so the digest blob
+        # itself stays O(1) in history size instead of O(n). The routed path
+        # (max_old_lines=None) keeps the full per-turn digest unchanged.
+        dropped = len(lines) - max(1, max_old_lines)
+        lines = (
+            [f"[…{dropped} earlier turns omitted from this digest…]"]
+            + lines[-max(1, max_old_lines):]
+        )
     digest = {
         "role": "user",
         "content": (
@@ -239,6 +280,56 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
         ),
     }
     return [digest] + keep
+
+
+def _parent_cache_effective(agent: Any) -> bool:
+    """True when the provider actually returns prompt-cache reads for this
+    session's main-model traffic.
+
+    The same-model fork only beats a digest when the replayed prefix hits the
+    provider's cache. Some deployments (e.g. ollama-cloud, 2026-08-27 burn
+    investigation) report cache_read_tokens=0 on EVERY response — there the
+    full replay is just a cold write of the whole transcript, times the
+    iteration count. Reading the parent's own session counters (not a config
+    flag) keeps the policy provider-neutral and requires zero new
+    configuration. A brand-new session with zero API calls yet is treated as
+    cache-unknown → cache-effective (full replay), so nothing changes for a
+    normal parent that fires a review right after its first turn.
+    """
+    try:
+        if int(getattr(agent, "session_api_calls", 0) or 0) <= 0:
+            return True  # cache behavior unknown; keep the warm-replay default
+        return int(getattr(agent, "session_cache_read_tokens", 0) or 0) > 0
+    except Exception:
+        logger.debug(
+            "parent cache-effectiveness probe failed; assuming cache-effective",
+            exc_info=True,
+        )
+        return True
+
+
+def _review_history_for_fork(
+    messages_snapshot: List[Dict], *, routed: bool, parent_cache_effective: bool
+) -> List[Dict]:
+    """Pick the replay payload for the review fork.
+
+    Full snapshot ONLY when the fork can actually hit a warm prefix: same
+    model AND the parent's session shows real cache reads. Digest when routed
+    to a different model (cold key regardless — the pre-existing rule) OR when
+    the provider demonstrably never returns cache reads (full replay would be
+    a cold write of the entire transcript, once per iteration).
+
+    The no-cache digest additionally caps the digest blob itself
+    (``max_old_lines=40``), because there the digest must stay bounded no
+    matter how long the session grew — the whole point is that every
+    iteration re-sends the replay cold. The routed path keeps the unbounded
+    per-turn digest (single cold write, historically fine).
+    """
+    if not routed and parent_cache_effective:
+        return messages_snapshot
+    return _digest_history(
+        messages_snapshot, max_old_lines=None if routed else 40
+    )
 
 
 # Review-prompt strings — used by ``spawn_background_review_thread`` to build
@@ -1019,7 +1110,7 @@ def _run_review_in_thread(
                         _fork_kwargs[_pref_attr] = _pref_val
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
-                max_iterations=_REVIEW_MAX_ITERATIONS,
+                max_iterations=_resolve_review_max_iterations(task_cfg),
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
@@ -1172,13 +1263,38 @@ def _run_review_in_thread(
             except Exception:
                 pass
 
+            # Refusal-streak circuit breaker: bind a breaker to this fork's
+            # context so repeated curator-guard refusals (a stuck retry loop
+            # re-sending the whole history every iteration) drain the fork's
+            # iteration budget instead of running to the cap. Installed AFTER
+            # the read-mark reset (which shares this thread's context) and
+            # cleared in the finally below.
+            _breaker = None
             try:
-                # Routed to a different model -> replay a digest (cache is cold
-                # on that model anyway, so minimise cold-written tokens). Same
-                # model -> replay the full snapshot (warm cache reads).
-                _review_history = (
-                    _digest_history(messages_snapshot) if _routed
-                    else messages_snapshot
+                from agent.background_review_breaker import install_review_breaker
+
+                _breaker = install_review_breaker(
+                    review_agent,
+                    threshold=max(2, _resolve_review_max_iterations(task_cfg) // 2),
+                )
+            except Exception:
+                logger.debug(
+                    "review refusal breaker install failed (continuing without)",
+                    exc_info=True,
+                )
+
+            try:
+                # Full replay ONLY when the fork can actually hit a warm
+                # prefix: same model AND the parent's session shows real
+                # provider cache reads. Digest when routed to a different
+                # model (cold key regardless — pre-existing rule) OR when the
+                # provider demonstrably never returns cache reads, where a
+                # full replay would cold-write the whole transcript once per
+                # iteration (the 2026-08-27 multi-million-token burn).
+                _review_history = _review_history_for_fork(
+                    messages_snapshot,
+                    routed=_routed,
+                    parent_cache_effective=_parent_cache_effective(agent),
                 )
                 review_agent.run_conversation(
                     user_message=(
@@ -1190,6 +1306,17 @@ def _run_review_in_thread(
                     conversation_history=_review_history,
                 )
             finally:
+                # Breaker first: unbind from this thread's context before any
+                # later code in the teardown observes further tool results.
+                if _breaker is not None:
+                    try:
+                        from agent.background_review_breaker import (
+                            reset_review_breaker,
+                        )
+
+                        reset_review_breaker(_breaker)
+                    except Exception:
+                        pass
                 clear_thread_tool_whitelist()
                 # Attribute the review fork's usage to the PARENT session.
                 # Snapshot BEFORE unregister/close so counters survive teardown.
