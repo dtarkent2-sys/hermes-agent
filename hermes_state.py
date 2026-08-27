@@ -12202,11 +12202,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if self.get_meta(gate) == "1":
             return 0
 
+        # Separator-agnostic child match, mirroring _cwd_prefix_clause: the
+        # dispatcher's workspaces root arrives with the platform's own
+        # separators, but stored ``cwd`` values were written by whatever
+        # process created the session — on Windows os.getcwd() reports
+        # backslashes while POSIX writers (and pathlib as_posix()) emit
+        # forward slashes. Matching only ``prefix/%`` silently reclaimed
+        # nothing on Windows.
+        esc = _escape_like(prefix)
+
         def _do(conn):
             cursor = conn.execute(
                 "UPDATE sessions SET source = 'kanban' "
-                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, _escape_like(prefix) + "/%"),
+                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\' "
+                "OR cwd LIKE ? ESCAPE '\\')",
+                (prefix, esc + "/%", esc + "\\\\%"),
             )
             # Read rowcount before set_meta reuses this cursor for its INSERT,
             # which would otherwise overwrite it with the meta write's count.

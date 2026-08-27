@@ -820,7 +820,10 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    # git prints porcelain paths with forward slashes on every platform;
+    # a WindowsPath str() has backslashes, so compare in normalized form.
+    assert f"worktree {target}" in listed.replace("\\", "/") or \
+        f"worktree {target.as_posix()}" in listed
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1410,6 +1413,11 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
+    # _resolve_hermes_argv does not consult shutil.which for bare names on
+    # Windows — it uses its own PATH walker (_safe_which_no_cwd) to avoid
+    # implicit current-dir resolution. Patch it too, or the venv's
+    # hermes.EXE still resolves and the fallback never triggers.
+    monkeypatch.setattr(kb, "_safe_which_no_cwd", lambda name: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 

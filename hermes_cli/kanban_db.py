@@ -8195,6 +8195,26 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+def _decode_wait_status(raw: int) -> "tuple[str, int]":
+    """Decode a POSIX wait status without ``os.WIF*`` helpers.
+
+    Windows (and any other platform where ``os.WIFEXITED`` and friends do
+    not exist) still needs to interpret the raw wait statuses the test /
+    tooling paths record into ``_recent_worker_exits``. The status layout
+    is fixed by POSIX (glibc ``sys/wait.h``): the low 7 bits carry the
+    terminating signal, bit 7 (0x80) is the core-dump flag, and bits 8-15
+    carry the exit code. ``WIFEXITED(s)`` is exactly ``(s & 0x7f) == 0``
+    and ``WEXITSTATUS(s)`` is ``(s >> 8) & 0xff``, so the decode needs
+    nothing platform-specific.
+
+    Returns ``("exit", code)`` or ``("signal", sig)``.
+    """
+    low = raw & 0x7F
+    if low == 0:
+        return ("exit", (raw >> 8) & 0xFF)
+    return ("signal", low)
+
+
 def _classify_worker_exit(
     pid: int,
     run_id: Optional[int] = None,
@@ -8258,13 +8278,18 @@ def _classify_worker_exit(
         if state_code == KANBAN_PROVIDER_OUTAGE_EXIT_CODE:
             return ("provider_outage", state_code)
     # 2. POSIX wait-status registry (authoritative where reaping is live).
+    #    Decoded without os.WIF*: those helpers are absent on Windows, and
+    #    letting the AttributeError collapse every classified exit into
+    #    "unknown" mislabeled clean-exit protocol violations as plain
+    #    "pid not alive" crashes there (which also broke the violation-only
+    #    retry budget — the streak never counted any violations).
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
     try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
+        decoded_kind, code = _decode_wait_status(int(raw))
+        if decoded_kind == "exit":
             if code == 0:
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
@@ -8272,8 +8297,7 @@ def _classify_worker_exit(
             if code == KANBAN_PROVIDER_OUTAGE_EXIT_CODE:
                 return ("provider_outage", code)
             return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
+        return ("signaled", code)
     except Exception:
         pass
     return ("unknown", None)
