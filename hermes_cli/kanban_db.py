@@ -3207,6 +3207,34 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+_CLAIM_LOCK_RE = re.compile(r"^.+:\d+$")
+
+
+def _flag_claim_lock_anomaly(
+    conn: sqlite3.Connection,
+    task_id: str,
+    lock: str,
+    *,
+    source: str,
+) -> None:
+    """Record a ``claim_lock_anomaly`` event for a non ``host:pid`` lock.
+
+    Synthetic lock values (e.g. ``SharkQuant:mock`` from an out-of-band
+    repair script) defeat pid recovery at reclaim time and pair badly with
+    NULL ``worker_pid`` (duplicate-worker class, t_78394445). Flagging at
+    write time makes any future synthetic write attributable in the event
+    log the moment it lands. Callers must be inside a ``write_txn``.
+    """
+    _append_event(
+        conn, task_id, "claim_lock_anomaly",
+        {
+            "claim_lock": lock,
+            "expected_format": "host:pid",
+            "source": source,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -4892,6 +4920,8 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        if not _CLAIM_LOCK_RE.match(lock):
+            _flag_claim_lock_anomaly(conn, task_id, lock, source="claim_task")
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4991,6 +5021,10 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
+        if not _CLAIM_LOCK_RE.match(lock):
+            _flag_claim_lock_anomaly(
+                conn, task_id, lock, source="claim_review_task",
+            )
         return get_task(conn, task_id)
 
 
@@ -5206,6 +5240,30 @@ def release_stale_claims(
                 )
             continue
 
+        # Unresolvable-pid guard (duplicate-worker class, t_78394445): a
+        # claim with NO worker_pid but a PRESENT, FRESH heartbeat is the
+        # signature of out-of-band row surgery (repair scripts rewriting
+        # claim_lock to a synthetic value and NULLing worker_pid on live
+        # tasks). We cannot probe the pid (it is gone from the row), so the
+        # worker may well be alive; terminating is impossible and releasing
+        # the claim would let the dispatcher spawn a duplicate beside it.
+        # Treat it exactly like ttl_expired_worker_alive: hold the claim and
+        # retry next tick. A NULL heartbeat is NOT a liveness signal — that
+        # is the crash-before-first-heartbeat case and must reclaim as
+        # before, or dead workers would wedge the board indefinitely.
+        if row["worker_pid"] is None and hb is not None and not heartbeat_stale:
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], row["claim_lock"], now,
+                {
+                    "prev_pid": None,
+                    "worker_pid": None,
+                    "heartbeat_stale": False,
+                    "reason": "worker_pid_unresolvable",
+                },
+                reason="worker_pid_unresolvable",
+            )
+            continue
+
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
@@ -5250,6 +5308,13 @@ def release_stale_claims(
                 "heartbeat_stale": bool(heartbeat_stale),
                 "retry_status": retry_status,
             }
+            # Row-derived facts win over the termination helper's defaults:
+            # when termination was not attempted (no pid, non-local lock) the
+            # helper's ``host_local=False`` default would otherwise clobber
+            # the row-level answer and understate host-locality in the event
+            # (t_78394445: all four 2026-08-27 incident events showed
+            # host_local: false although the locks were host-prefixed).
+            termination.pop("host_local", None)
             payload.update(termination)
             _append_event(
                 conn, row["id"], "reclaimed",

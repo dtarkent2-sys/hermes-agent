@@ -251,8 +251,247 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
+def test_stale_claim_null_pid_fresh_heartbeat_defers_reclaim(
+    kanban_home, monkeypatch,
+):
+    """NULL worker_pid + expired claim + FRESH heartbeat must NOT release.
+
+    Regression for the 2026-08-27 15:40 reclaim batch: an out-of-band repair
+    rewrote ``claim_lock`` to a synthetic value and ``worker_pid`` to NULL on
+    live tasks. ``release_stale_claims`` could neither probe nor extend (the
+    live-pid branch requires a non-NULL pid), so fresh-heartbeat live workers
+    fell through to reclaim; ``_terminate_reclaimed_worker`` no-opped at the
+    no-pid guard, the claim released normally, and the dispatcher spawned a
+    duplicate beside the still-running worker (duplicate-worker class,
+    t_78394445). An unresolvable-pid claim with an observable heartbeat is
+    exactly the "may still be alive" state — the claim must be held (deferred)
+    and retried, never released.
+    """
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:12345")
+        # Out-of-band repair damage: synthetic lock + NULL pid, live worker.
+        old_expires = int(time.time()) - 3600
+        hb_at = int(time.time()) - 60  # fresh heartbeat (max stale is 1h)
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, worker_pid = NULL, "
+            "claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (f"{host}:mock", old_expires, hb_at, t),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+
+        assert reclaimed == 0
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        assert row["status"] == "running", "claim must stay running"
+        assert row["claim_lock"] == f"{host}:mock"
+        assert row["claim_expires"] > int(time.time()), "claim extended (held)"
+
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'reclaim_deferred' "
+            "ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert ev is not None, "deferral must be observable in the event log"
+        payload = json.loads(ev["payload"])
+        assert payload["reason"] == "worker_pid_unresolvable"
+        assert payload["worker_pid"] is None
+        assert payload["heartbeat_stale"] is False
+
+        # No reclaimed event, and the run must still be open.
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'reclaimed'",
+            (t,),
+        ).fetchone() is None
+        run = conn.execute(
+            "SELECT status FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert run["status"] == "running"
 
 
+def _deferred_reclaim_row(kanban_home, monkeypatch, *, worker_pid, hb_offset):
+    """Set up a claim in the deferred-reclaim state and run the sweep.
+
+    Shared harness for the NULL-pid defer matrix: builds a claimed task,
+    optionally stamps ``worker_pid``, expires the claim, sets the heartbeat
+    ``hb_offset`` seconds ago, then calls ``release_stale_claims``.
+    Returns ``(reclaimed_count, task_id)``.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:12345")
+        if worker_pid is not None:
+            kb._set_worker_pid(conn, t, worker_pid)
+        old_expires = int(time.time()) - 3600
+        hb_at = int(time.time()) + hb_offset
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+            "WHERE id = ?",
+            (old_expires, hb_at, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        return kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None), t
+
+
+def test_stale_claim_null_pid_no_heartbeat_releases_normally(
+    kanban_home, monkeypatch,
+):
+    """NULL pid with NO heartbeat at all is the classic crashed-worker case.
+
+    Without a heartbeat there is no observable liveness signal, so the claim
+    must reclaim exactly as before the hardening (dead workers must not wedge
+    the board forever)."""
+    reclaimed, t = _deferred_reclaim_row(
+        kanban_home, monkeypatch, worker_pid=None, hb_offset=-7200,
+    )
+    assert reclaimed == 1
+    with kb.connect() as conn:
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "reclaimed" in kinds
+        assert "reclaim_deferred" not in kinds
+
+
+def test_stale_claim_null_pid_stale_heartbeat_reclaims_wedged_worker(
+    kanban_home, monkeypatch,
+):
+    """NULL pid + stale (1h+) heartbeat = wedged worker, still reclaimable.
+
+    The freshness check only protects observably-live workers; the heartbeat
+    backstop must keep working when the pid is gone from the row too."""
+    reclaimed, t = _deferred_reclaim_row(
+        kanban_home, monkeypatch, worker_pid=None, hb_offset=-5400,
+    )
+    assert reclaimed == 1
+    with kb.connect() as conn:
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "reclaimed" in kinds
+        assert "reclaim_deferred" not in kinds
+
+
+def test_reclaimed_event_host_local_reflects_claim_lock_not_termination_default(
+    kanban_home, monkeypatch,
+):
+    """The ``reclaimed`` event must report the row's host-locality.
+
+    2026-08-27 15:40 incident (t_78394445): all four reclaimed events showed
+    ``host_local: false`` although every lock WAS host-prefixed. The payload
+    correctly set ``host_local`` from the row, then ``payload.update(
+    termination)`` clobbered it with ``_terminate_reclaimed_worker``'s
+    default — which is False whenever termination was not attempted (no pid,
+    non-local kill unavailable). An event that understates host-locality
+    misleads incident triage (operators look for the worker on the wrong
+    host).
+
+    Repro uses the incident shape: ``worker_pid`` NULL (so the termination
+    helper early-returns with its ``host_local=False`` default) on a
+    host-prefixed lock, with no heartbeat (so the row reaches the release
+    path rather than the defer guard).
+    """
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:54321")
+        old_expires = int(time.time()) - 3600
+        # Incident shape: synthetic lock suffix, worker_pid NULL, no
+        # heartbeat — reaches the release path, never a termination.
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, worker_pid = NULL, "
+            "claim_expires = ?, last_heartbeat_at = NULL WHERE id = ?",
+            (f"{host}:mock", old_expires, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'reclaimed'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload["host_local"] is True, (
+            "row-level host_local (lock is host-prefixed) must survive the "
+            "termination-dict merge"
+        )
+        assert payload["stale_lock"] == f"{host}:mock"
+        # The termination helper never ran (no pid): its default
+        # termination_attempted=False must not carry the host_local flag.
+        assert payload["termination_attempted"] is False
+
+
+def test_claim_write_flags_synthetic_lock_format(kanban_home):
+    """Caller-provided claim locks must be format-checked at write time.
+
+    t_78394445: an out-of-band repair script rewrote ``claim_lock`` to the
+    synthetic ``SharkQuant:mock`` and NULLed ``worker_pid`` on live rows —
+    invisible at write time, catastrophic at reclaim time. The in-repo claim
+    write paths must FLAG claim locks that do not match ``<host>:<pid>``
+    (a ``claim_lock_anomaly`` event) so any future synthetic write is
+    attributable the moment it lands. Flag, not reject: friendly claimer
+    strings are a legitimate API for tests/external drivers, and the reclaim
+    defer guard (not this check) is what prevents duplication.
+    """
+    import json
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        claimed = kb.claim_task(conn, t, claimer="SharkQuant:mock")
+        assert claimed is not None  # claim proceeds; the anomaly is flagged
+        events = kb.list_events(conn, t)
+        anomaly = [
+            e for e in events if e.kind == "claim_lock_anomaly"
+        ]
+        assert anomaly, "synthetic lock write must emit a claim_lock_anomaly event"
+        payload = anomaly[-1].payload
+        assert payload["claim_lock"] == "SharkQuant:mock"
+        assert "host:pid" in payload["expected_format"]
+
+        # Well-formed locks must NOT be flagged.
+        host = kb._claimer_id().split(":", 1)[0]
+        t2 = kb.create_task(conn, title="y", assignee="a")
+        kb.claim_task(conn, t2, claimer=f"{host}:999")
+        assert [
+            e for e in kb.list_events(conn, t2) if e.kind == "claim_lock_anomaly"
+        ] == []
+
+        # Default claimer (_claimer_id, always host:pid) is never flagged.
+        t3 = kb.create_task(conn, title="z", assignee="a")
+        kb.claim_task(conn, t3)
+        assert [
+            e for e in kb.list_events(conn, t3) if e.kind == "claim_lock_anomaly"
+        ] == []
+
+        # Review-claim path is guarded too. request_review requires proof of
+        # ownership (expected_run_id) to clear a live claim, so pin the run.
+        run_id2 = kb.get_task(conn, t2).current_run_id
+        kb.request_review(conn, t2, summary="r", expected_run_id=run_id2)
+        kb.claim_review_task(conn, t2, claimer="SharkQuant:mock2")
+        anomaly2 = [
+            e for e in kb.list_events(conn, t2) if e.kind == "claim_lock_anomaly"
+        ]
+        assert anomaly2, "review claims must be format-checked as well"
+        assert anomaly2[-1].payload["claim_lock"] == "SharkQuant:mock2"
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit + provider-outage requeue: a worker that bails on a provider
 
 
 # ---------------------------------------------------------------------------
