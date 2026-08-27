@@ -142,7 +142,13 @@ class TestReadJournalMode:
             holder.close()
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(
+        # os.geteuid is POSIX-only, and a skipif condition is evaluated at
+        # collection time — calling it unguarded would raise AttributeError
+        # and take the whole module down on Windows.
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores file permissions",
+    )
     def test_read_only_directory_is_still_readable(self, tmp_path):
         db = tmp_path / "state.db"
         _make_db(db, journal_mode="WAL")
@@ -280,7 +286,12 @@ class TestUnreadableReason:
     def test_missing_file_keeps_the_os_error_text(self, tmp_path):
         reason = doctor._unreadable_reason(tmp_path / "gone.db")
 
-        assert "No such file or directory" in reason
+        # The probe preserves the raw OS error text, and that text differs
+        # per platform (POSIX strerror vs WinError message).
+        if os.name == "nt":
+            assert "cannot find the file" in reason
+        else:
+            assert "No such file or directory" in reason
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
     @pytest.mark.skipif(
@@ -363,7 +374,10 @@ class TestReportDatabaseJournalModes:
         assert "state.db is in WAL mode" in out
         assert "projects.db: rollback journal mode" in out
         assert "kanban.db: rollback journal mode" in out
-        assert "kanban/boards/myboard/kanban.db is in WAL mode" in out
+        # The display name is the OS-native relative path, so build the
+        # expected string with native separators.
+        board_display = os.path.join("kanban", "boards", "myboard", "kanban.db")
+        assert f"{board_display} is in WAL mode" in out
 
     def test_missing_databases_are_skipped(self, tmp_path, capsys):
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
@@ -387,7 +401,13 @@ class TestReportDatabaseJournalModes:
         assert "state.db: rollback journal mode" in out
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(
+        # os.geteuid is POSIX-only, and a skipif condition is evaluated at
+        # collection time — calling it unguarded would raise AttributeError
+        # and take the whole module down on Windows.
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores file permissions",
+    )
     def test_unreadable_database_does_not_crash(self, tmp_path, capsys):
         db = tmp_path / "state.db"
         _make_db(db)
