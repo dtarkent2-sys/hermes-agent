@@ -638,6 +638,7 @@ class TestRunJobEnvVarCleanup:
         assert os.environ.get("HERMES_SESSION_CHAT_ID") is None
         assert os.environ.get("HERMES_SESSION_CHAT_NAME") is None
 
+
 class TestResolveCronBash:
     """Direct unit coverage for _resolve_cron_bash.
 
@@ -748,3 +749,205 @@ class TestRunJobScriptBash:
         assert success is False
         assert "bash not found" in output
         assert "forced-unavailable" in output
+
+
+class TestBareBaseRedirect:
+    """Bare uv base interpreter -> Hermes venv python (t_abd98d07).
+
+    The gateway scheduler itself can run under the bare uv BASE interpreter
+    (no pyvenv.cfg venv anywhere above it).  Scripts launched from there get
+    no venv packages, no tz database and no editable finder — and every
+    ``sys.executable`` grandchild inherits the same bare base.  The fix
+    redirects the .py script to the Hermes repo's own venv python so the
+    whole process tree runs a real venv.
+    """
+
+    @pytest.mark.windows_only
+    def test_bare_base_python_redirects_to_hermes_venv(self, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _windows_cron_python_invocation
+
+        bare_base = r"C:\fake\uv\python\cpython-3.11.15-windows-x86_64-none\python.exe"
+        fake_venv_py = r"C:\fake\hermes-agent\venv\Scripts\python.exe"
+        monkeypatch.setattr(
+            sched_mod,
+            "_resolve_hermes_venv_python",
+            lambda repo_root=None: fake_venv_py,
+        )
+
+        exe, overlay = _windows_cron_python_invocation(bare_base)
+
+        assert exe == fake_venv_py
+        # No overlay: the venv python is self-sufficient (its own site-packages
+        # and pyvenv.cfg), so the script AND its sys.executable grandchildren
+        # get the full venv without env tricks.
+        assert overlay == {}
+
+    @pytest.mark.windows_only
+    def test_bare_base_redirect_is_idempotent_for_venv_python(self, monkeypatch):
+        """When sys.executable already IS the Hermes venv python the redirect
+        must not re-wrap it (guards against double-prefixing argv)."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _windows_cron_python_invocation
+
+        fake_venv_py = r"C:\fake\hermes-agent\venv\Scripts\python.exe"
+        monkeypatch.setattr(
+            sched_mod,
+            "_resolve_hermes_venv_python",
+            lambda repo_root=None: fake_venv_py,
+        )
+
+        exe, overlay = _windows_cron_python_invocation(fake_venv_py)
+
+        assert exe == fake_venv_py
+        assert overlay == {}
+
+    @pytest.mark.windows_only
+    def test_bare_base_without_repo_venv_keeps_plain_invocation(self, monkeypatch):
+        """No resolvable repo venv -> keep the bare base (previous behaviour):
+        running with it is better than failing the job outright."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _windows_cron_python_invocation
+
+        bare_base = r"C:\fake\uv\python\cpython-3.11.15-windows-x86_64-none\python.exe"
+        monkeypatch.setattr(
+            sched_mod,
+            "_resolve_hermes_venv_python",
+            lambda repo_root=None: None,
+        )
+
+        exe, overlay = _windows_cron_python_invocation(bare_base)
+
+        assert exe == bare_base
+        assert overlay == {}
+
+    @pytest.mark.windows_only
+    def test_real_uv_venv_launcher_still_takes_overlay_branch(self, tmp_path, monkeypatch):
+        """The t_083a97d8 uv-venv overlay branch must be untouched: a venv
+        launcher python still resolves to base python + VIRTUAL_ENV overlay,
+        NOT to the bare-base venv redirect."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _windows_cron_python_invocation
+
+        venv = tmp_path / "venv"
+        base = tmp_path / "base"
+        (venv / "Scripts").mkdir(parents=True)
+        (venv / "Lib" / "site-packages").mkdir(parents=True)
+        base.mkdir()
+        venv_python = venv / "Scripts" / "python.exe"
+        base_python = base / "python.exe"
+        venv_python.write_text("", encoding="utf-8")
+        base_python.write_text("", encoding="utf-8")
+        (venv / "pyvenv.cfg").write_text(f"home = {base}\nuv = true\n", encoding="utf-8")
+
+        def _forbidden(repo_root=None):
+            raise AssertionError("resolver must not be called for uv venv launchers")
+
+        monkeypatch.setattr(sched_mod, "_resolve_hermes_venv_python", _forbidden)
+
+        exe, overlay = _windows_cron_python_invocation(str(venv_python))
+
+        assert exe == str(base_python)
+        assert overlay.get("VIRTUAL_ENV") == str(venv)
+
+    @pytest.mark.windows_only
+    def test_run_job_script_bare_base_end_to_end(self, cron_env, monkeypatch):
+        """Through the real _run_job_script path with sys.executable pointing
+        at the bare uv base: the script must actually execute under the real
+        Hermes venv python (no mocking of Popen) and its grandchild spawned
+        via sys.executable must inherit the full venv."""
+        import subprocess
+
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        bare_base = (
+            r"C:\Users\dtark\AppData\Roaming\uv\python"
+            r"\cpython-3.11.15-windows-x86_64-none\python.exe"
+        )
+        if not Path(bare_base).is_file():
+            pytest.skip("bare uv base cpython-3.11.15 not present on this host")
+        real_venv_py = sched_mod._resolve_hermes_venv_python()
+        if not real_venv_py:
+            pytest.skip("Hermes repo venv not present")
+
+        # The cron script spawns a grandchild via sys.executable — the exact
+        # failure shape from t_66e155aa / t_b4879bcd.
+        script = cron_env / "scripts" / "grandchild_probe.py"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import json
+                import subprocess
+                import sys
+
+                code = (
+                    "import sys, json;\\n"
+                    "out = {'exe': sys.executable}\\n"
+                    "try:\\n"
+                    "    import requests; out['requests'] = requests.__version__\\n"
+                    "except Exception as exc:\\n"
+                    "    out['requests'] = repr(exc)\\n"
+                    "try:\\n"
+                    "    from zoneinfo import ZoneInfo\\n"
+                    "    ZoneInfo('America/New_York'); out['tz'] = 'OK'\\n"
+                    "except Exception as exc:\\n"
+                    "    out['tz'] = repr(exc)\\n"
+                    "try:\\n"
+                    "    import cron; out['cron'] = cron.__file__\\n"
+                    "except Exception as exc:\\n"
+                    "    out['cron'] = repr(exc)\\n"
+                    "print(json.dumps(out))\\n"
+                )
+                r = subprocess.run(
+                    [sys.executable, "-c", code],
+                    capture_output=True, text=True,
+                )
+                print("GRANDCHILD_RC=%d" % r.returncode)
+                print(r.stdout.strip())
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(sched_mod.sys, "executable", bare_base)
+
+        success, output = _run_job_script("grandchild_probe.py")
+
+        assert success is True, output
+        m = re.search(r"GRANDCHILD_RC=(\d+)", output)
+        assert m is not None, output
+        assert m.group(1) == "0", output
+        payload = json.loads(output.splitlines()[-1])
+        # The grandchild ran under the Hermes venv python and inherited the
+        # full venv: requests importable, a working tz database, and the
+        # editable-installed cron package.
+        assert Path(payload["exe"]).resolve() == Path(real_venv_py).resolve()
+        assert not str(payload["requests"]).startswith("ModuleNotFoundError")
+        assert payload["tz"] == "OK"
+        assert not str(payload["cron"]).startswith("ModuleNotFoundError")
+
+    def test_resolve_hermes_venv_python_layouts(self, tmp_path):
+        """Resolver: layout by platform, pyvenv.cfg required, None when the
+        venv directory is missing or not a real venv."""
+        from cron import scheduler as sched_mod
+
+        if sys.platform == "win32":
+            python_rel = ("Scripts", "python.exe")
+        else:
+            python_rel = ("bin", "python")
+        venv = tmp_path / "venv"
+        python_dir = venv / python_rel[0]
+        python_dir.mkdir(parents=True)
+        (python_dir / python_rel[1]).write_text("", encoding="utf-8")
+        (venv / "pyvenv.cfg").write_text("home = X\n", encoding="utf-8")
+        assert sched_mod._resolve_hermes_venv_python(tmp_path) == str(
+            python_dir / python_rel[1]
+        )
+
+        # Missing pyvenv.cfg -> not a venv -> None (the bare-base signal).
+        (venv / "pyvenv.cfg").unlink()
+        assert sched_mod._resolve_hermes_venv_python(tmp_path) is None
+
+        # No venv directory at all -> None.
+        assert sched_mod._resolve_hermes_venv_python(tmp_path / "nope") is None

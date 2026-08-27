@@ -3324,6 +3324,31 @@ def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     return parsed
 
 
+_CRON_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _resolve_hermes_venv_python(repo_root: Optional[Path] = None) -> Optional[str]:
+    """Resolve the Hermes repo's own virtual-environment interpreter.
+
+    Looks for ``venv/Scripts/python.exe`` (Windows) or ``venv/bin/python``
+    (POSIX) under *repo_root* and returns it only when the directory is a
+    real virtual environment (``pyvenv.cfg`` beside it).  Returns ``None``
+    when the repo ships no usable venv, so callers keep their previous
+    behaviour instead of failing the job.
+    """
+    root = Path(repo_root) if repo_root is not None else _CRON_REPO_ROOT
+    if sys.platform == "win32":
+        candidate = root / "venv" / "Scripts" / "python.exe"
+    else:
+        candidate = root / "venv" / "bin" / "python"
+    try:
+        if candidate.is_file() and (root / "venv" / "pyvenv.cfg").is_file():
+            return str(candidate)
+    except OSError:
+        return None
+    return None
+
+
 def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str]]:
     """Return an output-capable hidden Python invocation for Windows scripts.
 
@@ -3333,12 +3358,24 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     console interpreter and flash a visible window.  For uv venvs, bypass the
     launcher and run the base ``python.exe`` directly with the venv paths
     overlaid in the environment.
+
+    A *bare base* interpreter (a uv-managed CPython with no venv anywhere on
+    the reported path) is redirected to the Hermes repo's own ``venv``
+    interpreter when one exists: the bare base has none of the venv's site
+    packages (``ModuleNotFoundError: requests``, t_66e155aa), no tz database
+    (``ZoneInfoNotFoundError``, t_b4879bcd) and no editable finder, and uv
+    refuses in-place package fixes ("This Python installation is managed by
+    uv").  Running the script under the venv ``python.exe`` gives both the
+    direct script AND every ``sys.executable`` grandchild it spawns a fully
+    functional interpreter with the venv's site-packages, ``tzdata`` and the
+    editable ``cron`` package — the overlay mode below cannot do that,
+    because grandchildren spawned from the base ``python.exe`` report the
+    base as ``sys.executable`` and inherit none of the overlay.
     """
     if sys.platform != "win32":
         return python_exe, {}
 
     interpreter = Path(python_exe)
-    venv_dir = interpreter.parent.parent
     env_overlay: dict[str, str] = {}
 
     if interpreter.name.lower() == "pythonw.exe":
@@ -3346,10 +3383,14 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
         if sibling.exists():
             interpreter = sibling
 
+    venv_dir = interpreter.parent.parent
     cfg = _read_windows_pyvenv_cfg(venv_dir)
     home = cfg.get("home", "")
-    site_packages = venv_dir / "Lib" / "site-packages"
+
     if "uv" in cfg and home:
+        # uv venv launcher: bypass the re-execing launcher by running the
+        # base python.exe with the venv overlaid in the environment.
+        site_packages = venv_dir / "Lib" / "site-packages"
         base_python = Path(home) / "python.exe"
         if base_python.exists() and site_packages.exists():
             interpreter = base_python
@@ -3366,6 +3407,19 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             # script keeps its import surface while grandchildren inherit a
             # clean environment.  User-set PYTHONPATH entries still reach the
             # script: build_subprocess_env only strips Hermes-owned entries.
+            return str(interpreter), env_overlay
+
+    # Bare uv base (no pyvenv.cfg venv above the interpreter): the gateway
+    # itself may run here (uv tool env), and a script run under it would get
+    # no venv packages, no tz data and no editable finder — and worse, every
+    # sys.executable grandchild inherits the same bare base.  Redirect to the
+    # Hermes venv python when the repo ships one so the whole process tree
+    # runs a real venv.  Falls through unchanged when no venv is resolvable —
+    # running with the bare base is still better than failing the job.
+    if not cfg and python_exe:
+        venv_python = _resolve_hermes_venv_python()
+        if venv_python and Path(python_exe).resolve() != Path(venv_python).resolve():
+            return venv_python, {}
 
     return str(interpreter), env_overlay
 
@@ -3524,7 +3578,7 @@ def _resolve_cron_bash() -> tuple[Optional[str], str]:
     (explicit Program Files / portable-Git locations first, health-probed so
     the WSL stub fails loudly instead of silently mangling argv) and honours
     ``HERMES_GIT_BASH_PATH`` for custom installs.
-    \"\"\"
+    """
     if not _CRON_GIT_BASH_AVAILABLE or _cron_resolve_script_bash is None:
         # Degraded: tools.environments.local is unimportable.  POSIX keeps
         # the historical PATH->/bin/bash behaviour; on win32 refuse
@@ -3539,6 +3593,7 @@ def _resolve_cron_bash() -> tuple[Optional[str], str]:
         return None, "win32 without Git Bash support (tools.environments.local unavailable)"
 
     return _cron_resolve_script_bash()
+
 
 def _run_job_script(
     script_path: str,
