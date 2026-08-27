@@ -61,6 +61,19 @@ from agent.delegation_context import (
     exit_non_dispatcher_owned_context,
 )
 
+# Windows cron .sh/.bash resolution reuses the terminal's deterministic Git
+# Bash ladder (_find_bash) instead of a bare, PATH-dependent
+# shutil.which("bash") that can land on the WSL launcher stub after a
+# gateway restart with drifted env (exit 127, backslash-stripped argv).
+# Guarded: cron must stay importable even if the tools package moves.
+try:  # pragma: no cover - import guard exercised via _CRON_GIT_BASH_AVAILABLE
+    from tools.environments.local import _find_bash as _cron_find_bash
+
+    _CRON_GIT_BASH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _cron_find_bash = None
+    _CRON_GIT_BASH_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -3340,14 +3353,18 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
         if base_python.exists() and site_packages.exists():
             interpreter = base_python
             env_overlay["VIRTUAL_ENV"] = str(venv_dir)
-            pythonpath_entries = [
-                str(Path(__file__).resolve().parents[1]),
-                str(site_packages),
-            ]
-            existing_pythonpath = os.environ.get("PYTHONPATH", "")
-            if existing_pythonpath:
-                pythonpath_entries.append(existing_pythonpath)
-            env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+            # PYTHONPATH is deliberately NOT overlaid.  Injecting the Hermes
+            # venv's site-packages here poisons any grandchild interpreter the
+            # script spawns from a *different* Python version: the cp311
+            # entries land first in the child's sys.path and its compiled
+            # extension modules fail to load against a cp312 base
+            # (ModuleNotFoundError: numpy._core._multiarray_umath, seen on the
+            # toto 3.12 venv).  The bootstrap argv instead reattaches both the
+            # venv site-packages (.pth-aware, via site.addsitedir) and the
+            # Hermes repo root directly in the child's sys.path, so the direct
+            # script keeps its import surface while grandchildren inherit a
+            # clean environment.  User-set PYTHONPATH entries still reach the
+            # script: build_subprocess_env only strips Hermes-owned entries.
 
     return str(interpreter), env_overlay
 
@@ -3441,27 +3458,33 @@ def _windows_cron_bootstrap_argv(
     """Bootstrap a cron script under the base interpreter with ``.pth`` support.
 
     The uv-venv overlay mode runs the base ``python.exe`` (to avoid the
-    launcher re-execing a console interpreter and flashing a window) and
-    re-attaches the venv via ``PYTHONPATH``.  But ``PYTHONPATH`` entries are
-    plain ``sys.path`` additions — Python's site initialization never
-    processes ``.pth`` files for them (only ``site.addsitedir()`` does) — so
-    editable installs (``pip install -e``, ``__editable__*.pth`` links) are
-    invisible to cron script jobs.
+    launcher re-execing a console interpreter and flashing a window) with
+    ``VIRTUAL_ENV`` set in the environment.  The venv is reattached in-process:
+    ``site.addsitedir()`` on the venv ``site-packages`` makes ``.pth`` files
+    visible (``PYTHONPATH`` entries are plain ``sys.path`` additions — site
+    initialization never processes ``.pth`` files for them — so editable
+    installs (``pip install -e``, ``__editable__*.pth`` links) would be
+    invisible), and ``HERMES_CRON_REPO_ROOT`` re-adds the Hermes repo root.
+    Keeping both out of ``PYTHONPATH`` is deliberate: the script may spawn
+    grandchildren interpreters of a different Python version, and
+    ``PYTHONPATH`` entries are inherited verbatim by them (see
+    ``_windows_cron_python_invocation``).
 
-    Bootstrap with ``site.addsitedir()`` on the venv ``site-packages``, then
-    exec the script as ``__main__``.  ``runpy.run_path`` keeps ``__file__``
-    correct; ``sys.path[0]`` is set to the script's directory to preserve the
-    ``python script.py`` import semantics.  Note: ``runpy`` does not set
-    ``__package__``/``__spec__`` the way a direct invocation does, so
+    Then exec the script as ``__main__``.  ``runpy.run_path`` keeps
+    ``__file__`` correct; ``sys.path[0]`` is set to the script's directory to
+    preserve the ``python script.py`` import semantics.  Note: ``runpy`` does
+    not set ``__package__``/``__spec__`` the way a direct invocation does, so
     package-relative imports (``from . import x``) may behave differently.
     Falls back to a plain invocation if the venv layout is unresolvable —
-    the pre-existing PYTHONPATH behaviour is strictly better than failing
-    to run at all.
+    running with whatever the sanitized environment provides is strictly
+    better than failing to run at all.
     """
     site_packages = Path(env_overlay.get("VIRTUAL_ENV", "")) / "Lib" / "site-packages"
     if not site_packages.is_dir():
         # Silent here would make the "editable installs invisible" failure
-        # undiagnosable; the pre-existing PYTHONPATH-only behaviour applies.
+        # undiagnosable; fall back to a plain invocation — the script still
+        # runs (with whatever PYTHONPATH the sanitized environment provides)
+        # rather than failing outright.
         logger.warning(
             "Windows cron script: venv site-packages %s not found; running "
             "without .pth processing (editable installs may be unimportable)",
@@ -3470,6 +3493,8 @@ def _windows_cron_bootstrap_argv(
         return [python_exe, script_path]
     bootstrap = (
         "import os, runpy, site, sys;"
+        "root = os.environ.get('HERMES_CRON_REPO_ROOT');"
+        "sys.path.insert(0, root) if root else None;"
         f"site.addsitedir({str(site_packages)!r});"
         "script = sys.argv[1];"
         "sys.argv = [script] + sys.argv[2:];"
@@ -3477,6 +3502,46 @@ def _windows_cron_bootstrap_argv(
         "runpy.run_path(script, run_name='__main__')"
     )
     return [python_exe, "-c", bootstrap, script_path]
+
+
+def _resolve_cron_bash() -> tuple[Optional[str], str]:
+    """Resolve the bash interpreter for cron ``.sh``/``.bash`` scripts.
+
+    Returns ``(bash_path, source)`` where *source* explains where the
+    resolution came from (for diagnostics).
+
+    On POSIX this keeps the historical behaviour: ``shutil.which("bash")``
+    (PATH-dependent, correct there), then ``/bin/bash``.
+
+    On Windows a bare ``shutil.which("bash")`` is PATH-dependent and, after a
+    gateway restart with drifted env, resolves to ``System32\\bash.exe`` —
+    the WSL launcher, which mangles native Windows script paths (eats the
+    backslashes) and fails with ``/bin/bash: C:Users... No such file or
+    directory`` (exit 127).  Delegating to ``tools.environments.local``'s
+    ``_find_bash()`` gives the deterministic Git-Bash ladder (explicit
+    Program Files / portable-Git locations first, health-probed so the WSL
+    stub fails loudly instead of silently mangling argv) and honours
+    ``HERMES_GIT_BASH_PATH`` for custom installs.
+    """
+    if sys.platform != "win32":
+        found = shutil.which("bash")
+        if found:
+            return found, "PATH"
+        if os.path.isfile("/bin/bash"):
+            return "/bin/bash", "/bin/bash"
+        return None, "bash not found on PATH"
+
+    if not _CRON_GIT_BASH_AVAILABLE:
+        return None, "win32 without Git Bash support (tools.environments.local unavailable)"
+
+    try:
+        bash = _cron_find_bash()
+    except RuntimeError as exc:
+        # _find_bash raises when no candidate can start (or none exists);
+        # surface its message — it names the install URL and
+        # HERMES_GIT_BASH_PATH escape hatch.
+        return None, str(exc)
+    return bash, "tools.environments.local._find_bash (Git Bash ladder)"
 
 
 def _run_job_script(
@@ -3574,28 +3639,40 @@ def _run_job_script(
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
     if suffix in {".sh", ".bash"}:
-        # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-        # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
-        # than a FileNotFoundError with a confusing "[WinError 2]"
-        # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        # Resolve bash deterministically.  On Windows a bare
+        # shutil.which("bash") is PATH-dependent and can land on the WSL
+        # launcher stub (System32\bash.exe) after a gateway restart with
+        # drifted env — it mangles native Windows script paths (eats the
+        # backslashes) and fails with exit 127 and a "/bin/bash:" error.
+        # _resolve_cron_bash delegates to the terminal's Git Bash ladder
+        # (explicit Git-for-Windows / portable-Git locations, health-probed,
+        # HERMES_GIT_BASH_PATH honoured); on POSIX it keeps the historical
+        # PATH-then-/bin/bash behaviour.  On native Windows without Git for
+        # Windows installed we fall back to a clear error rather than a
+        # FileNotFoundError with a confusing "[WinError 2]" traceback.
+        _bash, _bash_source = _resolve_cron_bash()
         if _bash is None:
             return False, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
+                f"Cannot run .sh/.bash script {path.name!r}: bash not found. "
+                f"(resolved via {_bash_source}) "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
-        )
+            )
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         if env_overlay:
-            # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
-            # editable installs importable — .pth processing needs
-            # site.addsitedir() (see _windows_cron_bootstrap_argv).
+            # Overlay mode (Windows uv venv): the venv is reattached in the
+            # bootstrap (site.addsitedir + repo root on sys.path) instead of
+            # via PYTHONPATH, which would poison grandchildren interpreters
+            # running a different Python version — see
+            # _windows_cron_python_invocation. HERMES_CRON_REPO_ROOT carries
+            # the Hermes repo root to the bootstrap without touching
+            # PYTHONPATH.
+            env_overlay["HERMES_CRON_REPO_ROOT"] = str(
+                Path(__file__).resolve().parents[1]
+            )
             argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
         else:
             argv = [python_exe, str(path)]

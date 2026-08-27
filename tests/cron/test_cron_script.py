@@ -200,7 +200,15 @@ class TestRunJobScript:
         assert captured["kwargs"]["creationflags"] == expected_flags
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
-        assert str(site_packages) in env["PYTHONPATH"]
+        # PYTHONPATH must NOT be overlaid: it poisons grandchild interpreters
+        # of a different Python version (cp311 site-packages inherited by a
+        # cp312 venv -> numpy extension-module load failure, t_083a97d8).
+        assert "PYTHONPATH" not in env
+        # The Hermes repo root travels via a dedicated env var consumed by
+        # the bootstrap, keeping PYTHONPATH clean for grandchildren.
+        assert env["HERMES_CRON_REPO_ROOT"] == str(
+            Path(sched_mod.__file__).resolve().parents[1]
+        )
 
     def test_bootstrap_argv_makes_pth_editable_installs_importable(self, cron_env, tmp_path):
         """The bootstrap must process .pth files — the whole reason the
