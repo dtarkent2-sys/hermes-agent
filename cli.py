@@ -15960,6 +15960,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         "error": _summary,
                     }
                 finally:
+                    # Stash the turn outcome for exit-path consumers (the
+                    # kanban worker clean-exit channel reads this to
+                    # distinguish a completed turn from a failed one that
+                    # merely rendered "Error: …" and returned normally).
+                    self._last_turn_result = result
                     if _one_turn_model_restore:
                         self._restore_model_runtime_snapshot(_one_turn_model_restore)
                     # Surface any credit notices queued during the turn (cold-start
@@ -20162,13 +20167,35 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+# The HermesCLI instance created by main(). Used by the kanban worker
+# clean-exit channel to read the last turn's outcome (see
+# _record_kanban_worker_clean_exit). None until main() builds the CLI.
+_CURRENT_CLI: Optional["HermesCLI"] = None
+
+
 def _record_kanban_worker_clean_exit() -> None:
     """Persist a kanban worker's clean exit (rc=0) for the dispatcher.
 
     Called from BOTH single-query exit paths (``-Q`` quiet and plain ``-q``)
-    immediately before the process ends with exit code 0. Writes exit_code=0
+    right before the process would end with exit code 0. Writes exit_code=0
     to the per-run state file via the same cross-platform channel the
-    sentinel codes (75/76) already use.
+    sentinel codes (75/76) already use — but ONLY when the conversation turn
+    that just finished actually completed:
+
+    Why the gate matters: the plain ``-q`` path does NOT exit non-zero on a
+    failed turn — ``cli.chat()`` renders ``Error: …`` from a failed
+    ``run_conversation`` result and returns normally, so main() still exits
+    0. An unconditional clean-exit record would therefore mislabel a
+    rate-limited / server-errored worker as a clean exit. Instead, a failed
+    turn with a sentinel failure reason records the 75/76 sentinel here
+    (the -q path never reaches the -Q block that usually does this), and a
+    failed turn with a generic reason records nothing — the dispatcher then
+    sees ``unknown`` and counts the crash exactly as before.
+
+    Identity guard: delegate_task children and in-process cron jobs inherit
+    the worker's ``HERMES_KANBAN_TASK``/``RUN_ID`` env but do NOT own its
+    task; without this check such a child would ghost-write exit state for
+    the parent worker's run (the read side additionally verifies the pid).
 
     Why this matters: on Windows the dispatcher's POSIX reap loop is a no-op
     and the ``os.WIF*`` helpers do not exist, so a clean worker exit used to
@@ -20177,24 +20204,50 @@ def _record_kanban_worker_clean_exit() -> None:
     "pid not alive" crashes, bypassing the violation-only retry budget
     (t_6db38d4a). POSIX reaping still populates the wait-status registry;
     this file merely mirrors the same answer there. A crash path never
-    reaches the call sites (they run only after a successful conversation
-    turn, right before a rc=0 exit), so a recorded 0 is proof of a clean
-    exit. Never raises: a write failure must not change the exit code.
+    reaches the call sites (they run only after the conversation turn
+    ended), so a recorded 0 is proof of a clean exit. Never raises: a write
+    failure must not change the exit code.
     """
     if not os.environ.get("HERMES_KANBAN_TASK"):
         return
     try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        if not is_dispatcher_owned_worker_context():
+            return
+    except Exception:
+        pass
+    try:
         from hermes_cli.kanban_db import (
+            KANBAN_PROVIDER_OUTAGE_EXIT_CODE as _PO_CODE,
+            KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
             record_worker_exit_code as _rec_clean,
         )
         _run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
-        if _run_id:
-            _rec_clean(
-                int(_run_id),
-                0,
-                None,
-                pid=os.getpid(),
-            )
+        if not _run_id:
+            return
+        # Turn-outcome gate: chat() stashes the run_conversation result so
+        # this helper can distinguish a genuinely completed turn from a
+        # failed one that merely rendered "Error: …" and returned normally.
+        # Absent attribute (older callers / direct dispatch) conservatively
+        # records the clean exit — the write site only runs after a turn.
+        _res = getattr(_CURRENT_CLI, "_last_turn_result", None) if _CURRENT_CLI else None
+        _code = 0
+        _reason = None
+        if isinstance(_res, dict):
+            if not _res.get("failed"):
+                # Completed (or user-approved) turn: record the clean exit.
+                pass
+            else:
+                _fr = _res.get("failure_reason")
+                if _fr in ("rate_limit", "billing"):
+                    _code, _reason = _RL_CODE, _fr
+                elif _fr in ("server_error", "overloaded", "timeout"):
+                    _code, _reason = _PO_CODE, _fr
+                else:
+                    # Generic failure (exit_code == 1 contract): record
+                    # nothing so a real crash is never misclassified.
+                    return
+        _rec_clean(int(_run_id), _code, _reason, pid=os.getpid())
     except Exception:
         pass
 
@@ -20428,6 +20481,9 @@ def main(
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
     )
+    # Publish for the kanban worker clean-exit channel (module global).
+    global _CURRENT_CLI
+    _CURRENT_CLI = cli
 
     if parsed_skills:
         # Load the skill payloads in the background: skill_view walks the

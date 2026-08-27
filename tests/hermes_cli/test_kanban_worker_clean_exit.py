@@ -107,6 +107,115 @@ def test_state_file_zero_classifies_clean_exit_with_empty_registry(
     assert kb._classify_worker_exit(999, run_id=4242) == ("clean_exit", 0)
 
 
+def test_pid_mismatch_state_file_is_rejected_as_ghost_write(kanban_home):
+    """Ghost-write guard (read side): a state file stamped by a DIFFERENT
+    pid than the one being classified must not vouch for that process's
+    exit. The concrete scenario this blocks: a `hermes chat -q` child
+    spawned from a worker's shell inherits HERMES_KANBAN_RUN_ID and writes
+    the parent's run_<id>.json with its own pid; the dispatcher then reaps
+    the (dead or alive) PARENT and must not let that file vouch for it.
+    Files without a usable pid stamp stay trusted (the sentinel channel
+    predates pid stamping)."""
+    kb.record_worker_exit_code(4343, 0, None, pid=1111)
+    # Matching pid -> trusted.
+    assert kb._classify_worker_exit(1111, run_id=4343) == ("clean_exit", 0)
+    # Mismatched pid -> file treated as absent -> falls to empty registry.
+    assert kb._classify_worker_exit(2222, run_id=4343) == ("unknown", None)
+    # Same for the sentinel codes: a ghost must not forge a rate-limit
+    # release for a dead worker either.
+    kb.record_worker_exit_code(
+        4344, kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limit", pid=3333,
+    )
+    assert kb._classify_worker_exit(4444, run_id=4344) == ("unknown", None)
+    assert kb._classify_worker_exit(3333, run_id=4344) == (
+        "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+    # Legacy files (pid key absent / null) remain trusted under pid check.
+    path = kb._worker_exit_state_path(4345)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"run_id": 4345, "exit_code": 0, "pid": null}',
+                    encoding="utf-8")
+    assert kb._classify_worker_exit(5555, run_id=4345) == ("clean_exit", 0)
+
+
+# ---------------------------------------------------------------------------
+# Turn-outcome gate (write side, plain -q path): chat() renders "Error: …"
+# from a failed run_conversation result and returns normally, so the -q exit
+# code stays 0 — the clean-exit record must therefore read the stashed turn
+# outcome instead of trusting rc=0.
+# ---------------------------------------------------------------------------
+
+
+def _run_clean_exit_gate(monkeypatch, cli_mod, run_id, turn_result):
+    """Point _record_kanban_worker_clean_exit at ``run_id`` with
+    ``turn_result`` as the outcome stashed by chat(), and invoke it."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_gate")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    stub = type("StubCLI", (), {"_last_turn_result": turn_result})()
+    monkeypatch.setattr(cli_mod, "_CURRENT_CLI", stub)
+    cli_mod._record_kanban_worker_clean_exit()
+
+
+def test_turn_outcome_gate_maps_failed_turns_to_sentinels_or_silence(
+    kanban_home, monkeypatch,
+):
+    """Gate mapping mirrors the committed -Q precedent exactly:
+    completed turn -> clean 0; failed + rate_limit/billing -> the
+    rate-limit sentinel; failed + server_error/overloaded/timeout -> the
+    provider-outage sentinel; failed + generic reason -> NO file at all
+    (a real crash is never misclassified as a clean exit)."""
+    import json
+
+    import cli as cli_mod
+
+    # Completed turn -> the clean exit, reason-less.
+    _run_clean_exit_gate(monkeypatch, cli_mod, 6100, {"failed": False})
+    data = json.loads(
+        kb._worker_exit_state_path(6100).read_text(encoding="utf-8")
+    )
+    assert data["exit_code"] == 0
+    assert data["failure_reason"] is None
+
+    # Rate-limit / billing failures -> the SAME sentinel the -Q path
+    # writes (billing -> RL is the committed -Q precedent).
+    _run_clean_exit_gate(
+        monkeypatch, cli_mod, 6101,
+        {"failed": True, "failure_reason": "rate_limit"},
+    )
+    data = json.loads(
+        kb._worker_exit_state_path(6101).read_text(encoding="utf-8")
+    )
+    assert data["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert data["failure_reason"] == "rate_limit"
+
+    _run_clean_exit_gate(
+        monkeypatch, cli_mod, 6102,
+        {"failed": True, "failure_reason": "billing"},
+    )
+    data = json.loads(
+        kb._worker_exit_state_path(6102).read_text(encoding="utf-8")
+    )
+    assert data["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+    # Server-side outage family -> the provider-outage sentinel.
+    _run_clean_exit_gate(
+        monkeypatch, cli_mod, 6103,
+        {"failed": True, "failure_reason": "server_error"},
+    )
+    data = json.loads(
+        kb._worker_exit_state_path(6103).read_text(encoding="utf-8")
+    )
+    assert data["exit_code"] == kb.KANBAN_PROVIDER_OUTAGE_EXIT_CODE
+
+    # Generic failure: exit_code==1 contract — record NOTHING so the
+    # dispatcher counts an ordinary crash instead of a phantom clean exit.
+    _run_clean_exit_gate(
+        monkeypatch, cli_mod, 6104,
+        {"failed": True, "failure_reason": "agent_error"},
+    )
+    assert not kb._worker_exit_state_path(6104).exists()
+
+
 def test_state_file_sentinels_still_win_over_zero(kanban_home):
     """The sentinel classifications are unchanged by the clean-exit branch,
     and a state file recording a code that is neither sentinel nor 0 falls

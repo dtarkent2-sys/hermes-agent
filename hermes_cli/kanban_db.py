@@ -8467,8 +8467,11 @@ def _classify_worker_exit(
     #    first so the sentinel paths work where POSIX reaping is inert. A
     #    state file records only the two sentinel codes, so it cannot mask a
     #    genuine crash — anything else falls through to the registry below.
+    #    ``expected_pid=pid`` rejects ghost writes: the file must have been
+    #    stamped by the very process being classified, not by some other
+    #    process that inherited the run id (see read_worker_exit_code).
     if run_id is not None:
-        state_code, _state_reason = read_worker_exit_code(run_id)
+        state_code, _state_reason = read_worker_exit_code(run_id, expected_pid=pid)
         if state_code == KANBAN_RATE_LIMIT_EXIT_CODE:
             return ("rate_limited", state_code)
         if state_code == KANBAN_PROVIDER_OUTAGE_EXIT_CODE:
@@ -8628,7 +8631,8 @@ def record_worker_exit_code(
 
 
 def read_worker_exit_code(
-    run_id: Optional[int]
+    run_id: Optional[int],
+    expected_pid: Optional[int] = None,
 ) -> "tuple[Optional[int], Optional[str]]":
     """Read a worker's persisted sentinel exit code for ``run_id``.
 
@@ -8636,6 +8640,16 @@ def read_worker_exit_code(
     file exists, else ``(None, None)``. A missing / malformed / stale file
     all collapse to ``(None, None)`` so the caller falls back to the POSIX
     wait-status registry (or, on Windows, to the ``unknown`` crash path).
+
+    ``expected_pid`` (optional): when given, a state file whose recorded
+    ``pid`` differs is treated as absent. The writer stamps its own pid, so
+    a pid mismatch means the file was not written by the process being
+    classified — a ghost write (e.g. a ``hermes chat -q`` child spawned from
+    a worker's shell that inherited the parent's ``HERMES_KANBAN_RUN_ID``)
+    must never vouch for another process's exit. Files recorded before pid
+    stamping began (no ``pid`` key, or ``null``) stay trusted: the sentinel
+    channel predates the field and the write site is reached only after a
+    completed turn either way.
     """
     if run_id is None:
         return (None, None)
@@ -8651,6 +8665,10 @@ def read_worker_exit_code(
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return (None, None)
+        if expected_pid is not None:
+            recorded_pid = data.get("pid")
+            if isinstance(recorded_pid, int) and recorded_pid != int(expected_pid):
+                return (None, None)
         code = data.get("exit_code")
         if not isinstance(code, int):
             return (None, None)
