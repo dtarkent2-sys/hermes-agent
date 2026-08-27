@@ -61,17 +61,18 @@ from agent.delegation_context import (
     exit_non_dispatcher_owned_context,
 )
 
-# Windows cron .sh/.bash resolution reuses the terminal's deterministic Git
-# Bash ladder (_find_bash) instead of a bare, PATH-dependent
-# shutil.which("bash") that can land on the WSL launcher stub after a
-# gateway restart with drifted env (exit 127, backslash-stripped argv).
-# Guarded: cron must stay importable even if the tools package moves.
+# Windows cron .sh/.bash resolution goes through the shared script-runner
+# helper resolve_script_bash (tools.environments.local, beside _find_bash) —
+# the single owner of the deterministic Git Bash ladder — instead of a bare,
+# PATH-dependent shutil.which("bash") that can land on the WSL launcher stub
+# after a gateway restart with drifted env (exit 127, backslash-stripped
+# argv).  Guarded: cron must stay importable even if the tools package moves.
 try:  # pragma: no cover - import guard exercised via _CRON_GIT_BASH_AVAILABLE
-    from tools.environments.local import _find_bash as _cron_find_bash
+    from tools.environments.local import resolve_script_bash as _cron_resolve_script_bash
 
     _CRON_GIT_BASH_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    _cron_find_bash = None
+    _cron_resolve_script_bash = None
     _CRON_GIT_BASH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -3517,32 +3518,27 @@ def _resolve_cron_bash() -> tuple[Optional[str], str]:
     gateway restart with drifted env, resolves to ``System32\\bash.exe`` —
     the WSL launcher, which mangles native Windows script paths (eats the
     backslashes) and fails with ``/bin/bash: C:Users... No such file or
-    directory`` (exit 127).  Delegating to ``tools.environments.local``'s
-    ``_find_bash()`` gives the deterministic Git-Bash ladder (explicit
-    Program Files / portable-Git locations first, health-probed so the WSL
-    stub fails loudly instead of silently mangling argv) and honours
+    directory`` (exit 127).  Resolution goes through the shared script-runner
+    helper ``tools.environments.local.resolve_script_bash()`` — the single
+    owner of the deterministic Git-Bash ladder beside ``_find_bash()``
+    (explicit Program Files / portable-Git locations first, health-probed so
+    the WSL stub fails loudly instead of silently mangling argv) and honours
     ``HERMES_GIT_BASH_PATH`` for custom installs.
-    """
-    if sys.platform != "win32":
-        found = shutil.which("bash")
-        if found:
-            return found, "PATH"
-        if os.path.isfile("/bin/bash"):
-            return "/bin/bash", "/bin/bash"
-        return None, "bash not found on PATH"
-
-    if not _CRON_GIT_BASH_AVAILABLE:
+    \"\"\"
+    if not _CRON_GIT_BASH_AVAILABLE or _cron_resolve_script_bash is None:
+        # Degraded: tools.environments.local is unimportable.  POSIX keeps
+        # the historical PATH->/bin/bash behaviour; on win32 refuse
+        # PATH-dependent resolution (the WSL-stub hazard this helper exists
+        # to prevent).
+        if sys.platform != "win32":
+            found = shutil.which("bash")
+            if found:
+                return found, "PATH"
+            if os.path.isfile("/bin/bash"):
+                return "/bin/bash", "/bin/bash"
         return None, "win32 without Git Bash support (tools.environments.local unavailable)"
 
-    try:
-        bash = _cron_find_bash()
-    except RuntimeError as exc:
-        # _find_bash raises when no candidate can start (or none exists);
-        # surface its message — it names the install URL and
-        # HERMES_GIT_BASH_PATH escape hatch.
-        return None, str(exc)
-    return bash, "tools.environments.local._find_bash (Git Bash ladder)"
-
+    return _cron_resolve_script_bash()
 
 def _run_job_script(
     script_path: str,

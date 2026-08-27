@@ -14,6 +14,45 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# .sh/.bash route scripts resolve bash through the terminal's deterministic
+# Git Bash ladder (tools.environments.local.resolve_script_bash — the same
+# shared helper cron uses) instead of a bare, PATH-dependent
+# shutil.which("bash"): on Windows that can land on the WSL launcher stub
+# (System32 bash.exe) after a gateway restart with drifted env, which eats
+# the backslashes from the native script path and fails the route with
+# exit 127.  Guarded: the gateway must stay importable even if the tools
+# package moves.
+try:
+    from tools.environments.local import resolve_script_bash as _resolve_route_bash
+
+    _ROUTE_BASH_RESOLVER_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _resolve_route_bash = None
+    _ROUTE_BASH_RESOLVER_AVAILABLE = False
+
+
+def _resolve_webhook_bash() -> tuple[Optional[str], str]:
+    """Resolve bash for .sh/.bash webhook route scripts.
+
+    Delegates to the shared Git-Bash ladder in tools.environments.local
+    (same resolution cron's script runner uses).  Returns
+    ``(bash_path, source)``; a ``None`` path means the script cannot run
+    and *source* explains why.
+    """
+    if _ROUTE_BASH_RESOLVER_AVAILABLE and _resolve_route_bash is not None:
+        return _resolve_route_bash()
+    # Degraded: tools.environments.local is unimportable.  POSIX keeps the
+    # historical PATH→/bin/bash behaviour; on win32 refuse PATH-dependent
+    # resolution (a bare shutil.which("bash") can land on the WSL stub).
+    if sys.platform != "win32":
+        found = shutil.which("bash")
+        if found:
+            return found, "PATH"
+        if os.path.isfile("/bin/bash"):
+            return "/bin/bash", "/bin/bash"
+    return None, "bash resolution unavailable (tools.environments.local missing)"
+
+
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 30
 _MISSING = object()
 
@@ -234,11 +273,17 @@ class WebhookRouteProcessor:
 
         suffix = path.suffix.lower()
         if suffix in {".sh", ".bash"}:
-            bash = shutil.which("bash") or (
-                "/bin/bash" if os.path.isfile("/bin/bash") else None
-            )
+            # Resolve bash through the shared Git-Bash ladder (same helper
+            # cron's script runner uses).  A bare shutil.which("bash") here
+            # is PATH-dependent on Windows and can land on the WSL launcher
+            # stub (System32 bash.exe), which eats the backslashes from the
+            # native script path and fails the route with exit 127.
+            bash, bash_source = _resolve_webhook_bash()
             if bash is None:
-                logger.warning("[webhook] script ignored webhook: bash not found")
+                logger.warning(
+                    "[webhook] script ignored webhook: bash not found (%s)",
+                    bash_source,
+                )
                 return False, None
             argv = [bash, str(path)]
         else:

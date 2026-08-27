@@ -20233,6 +20233,20 @@ def main(
     except Exception:
         pass
 
+    # Kanban worker orphan containment (t_d3b27ff0 — 2026-08-27 crash loop):
+    # a dispatcher-spawned worker puts itself in a kill-on-close Win32 Job
+    # Object so that when the worker dies by ANY mechanism (OOM, WER,
+    # taskkill, os._exit), the kernel tears down its whole descendant tree
+    # instantly — no orphaned pytest can outlive a dead worker and balloon
+    # memory against live workers. Gated on HERMES_KANBAN_TASK (workers
+    # only; interactive sessions are untouched), no-op on POSIX, and
+    # best-effort (failure logs at debug and leaves prior behavior).
+    try:
+        from hermes_cli.worker_job_object import arm_kanban_worker_job_object
+        arm_kanban_worker_job_object()
+    except Exception:
+        pass  # never block worker startup on containment setup
+
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
     os.environ["HERMES_INTERACTIVE"] = "1"

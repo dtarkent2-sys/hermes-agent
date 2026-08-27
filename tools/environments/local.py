@@ -734,6 +734,53 @@ def build_subprocess_env(
     return env
 
 
+def resolve_script_bash() -> "tuple[str | None, str]":
+    """Resolve bash for trusted ``.sh``/``.bash`` script runners.
+
+    Single owner of bash resolution for the script-runner callers (cron's
+    ``scheduler._run_job_script`` and the gateway webhook adapter's
+    ``run_route_script``), so the deterministic Git-Bash ladder lives in
+    exactly one place beside :func:`_find_bash`.
+
+    Returns ``(bash_path, source)`` where *source* explains where the
+    resolution came from (for diagnostics); a ``None`` path means the
+    script cannot run and *source* says why.
+
+    POSIX keeps the historical behaviour: ``shutil.which("bash")``
+    (PATH-dependent, correct there), then ``/bin/bash``.  The terminal's
+    ``$SHELL`` / ``/bin/sh`` fallbacks in :func:`_find_bash` are
+    deliberately NOT applied here — a script runner must not silently
+    execute ``.sh`` files under a non-bash shell.
+
+    On Windows a bare ``shutil.which("bash")`` is PATH-dependent and, after
+    a gateway restart with drifted env, resolves to ``System32`` ``bash.exe``
+    — the WSL launcher, which mangles native Windows script paths (eats the
+    backslashes) and fails with ``/bin/bash: C:Users... No such file or
+    directory`` (exit 127).  Delegating to :func:`_find_bash` gives the
+    deterministic Git-Bash ladder (explicit Program Files / portable-Git
+    locations first, health-probed so the WSL stub fails loudly instead of
+    silently mangling argv) and honours ``HERMES_GIT_BASH_PATH`` for custom
+    installs.  ``_find_bash``'s "nothing found" ``RuntimeError`` is
+    converted into ``(None, message)`` so runners degrade to a clean
+    skip/error report instead of an exception.
+    """
+    if not _IS_WINDOWS:
+        found = shutil.which("bash")
+        if found:
+            return found, "PATH"
+        if os.path.isfile("/bin/bash"):
+            return "/bin/bash", "/bin/bash"
+        return None, "bash not found on PATH"
+
+    try:
+        return _find_bash(), "tools.environments.local._find_bash (Git Bash ladder)"
+    except RuntimeError as exc:
+        # _find_bash raises when no candidate can start (or none exists);
+        # surface its message — it names the install URL and the
+        # HERMES_GIT_BASH_PATH escape hatch.
+        return None, str(exc)
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:

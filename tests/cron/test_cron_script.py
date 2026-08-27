@@ -637,3 +637,114 @@ class TestRunJobEnvVarCleanup:
         assert os.environ.get("HERMES_SESSION_PLATFORM") is None
         assert os.environ.get("HERMES_SESSION_CHAT_ID") is None
         assert os.environ.get("HERMES_SESSION_CHAT_NAME") is None
+
+class TestResolveCronBash:
+    """Direct unit coverage for _resolve_cron_bash.
+
+    Previously this resolver had no direct unit tests — it was exercised
+    only via the ad-hoc E2E probe (V1 ladder / V5 import guard).  These
+    tests pin the resolution contract, including the win32 degradation
+    branch when tools.environments.local is unavailable.
+    """
+
+    def test_win32_tools_missing_degrades_to_error(self, monkeypatch):
+        """win32 + unimportable tools.environments.local must return
+        (None, reason) — it must NOT fall back to a bare, PATH-dependent
+        shutil.which("bash"), which can land on the WSL launcher stub."""
+        import shutil as _shutil
+
+        from cron import scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod, "_CRON_GIT_BASH_AVAILABLE", False)
+        monkeypatch.setattr(sched_mod, "_cron_resolve_script_bash", None)
+        # Belt and suspenders: even if a bash IS on PATH, the win32
+        # degraded branch must refuse PATH-dependent resolution.
+        monkeypatch.setattr(_shutil, "which", lambda name: "C:/Windows/System32/bash.exe" if name == "bash" else None)
+
+        bash, source = sched_mod._resolve_cron_bash()
+
+        assert bash is None
+        assert "win32 without Git Bash support" in source
+        assert "tools.environments.local unavailable" in source
+
+    def test_win32_delegates_to_shared_script_bash_helper(self, monkeypatch):
+        """When the tools package is importable, the win32 resolution is a
+        pure pass-through to the shared resolve_script_bash helper — cron
+        must not re-implement (or PATH-dependently shadow) the ladder."""
+        from cron import scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod, "_CRON_GIT_BASH_AVAILABLE", True)
+        monkeypatch.setattr(
+            sched_mod,
+            "_cron_resolve_script_bash",
+            lambda: ("C:/Program Files/Git/bin/bash.exe", "shared-ladder"),
+        )
+
+        assert sched_mod._resolve_cron_bash() == (
+            "C:/Program Files/Git/bin/bash.exe",
+            "shared-ladder",
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX branch; on Windows the shared-ladder delegation is tested above",
+    )
+    def test_posix_keeps_path_then_bin_bash(self):
+        """POSIX keeps the historical behaviour: PATH lookup, then
+        /bin/bash — resolution never returns a non-bash shell."""
+        import shutil as _shutil
+
+        from cron.scheduler import _resolve_cron_bash
+
+        if _shutil.which("bash") is None and not os.path.isfile("/bin/bash"):
+            pytest.skip("no bash on this POSIX host")
+
+        bash, _source = _resolve_cron_bash()
+
+        assert bash is not None
+        assert "bash" in os.path.basename(bash)
+
+
+class TestRunJobScriptBash:
+    """End-to-end .sh execution through _run_job_script."""
+
+    def test_sh_script_runs_via_deterministic_bash(self, cron_env):
+        """A real .sh script must execute with rc=0 through whatever bash
+        the resolver picked (Git Bash ladder on win32, PATH on POSIX)."""
+        from cron.scheduler import _resolve_cron_bash, _run_job_script
+
+        bash, _source = _resolve_cron_bash()
+        if bash is None:
+            pytest.skip("no bash available on this host")
+
+        script = cron_env / "scripts" / "probe.sh"
+        script.write_text('echo "hello-from-bash"\n', encoding="utf-8")
+
+        success, output = _run_job_script("probe.sh")
+
+        assert success is True, output
+        assert output == "hello-from-bash"
+
+    def test_bash_unavailable_fails_with_actionable_error(self, cron_env, monkeypatch):
+        """When bash cannot be resolved, the script fails with the
+        actionable 'bash not found' report (including the resolution
+        source) instead of a FileNotFoundError traceback."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(
+            sched_mod,
+            "_resolve_cron_bash",
+            lambda: (None, "forced-unavailable"),
+        )
+
+        script = cron_env / "scripts" / "probe.sh"
+        script.write_text('echo "never runs"\n', encoding="utf-8")
+
+        success, output = _run_job_script("probe.sh")
+
+        assert success is False
+        assert "bash not found" in output
+        assert "forced-unavailable" in output
