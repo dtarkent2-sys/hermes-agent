@@ -228,10 +228,13 @@ class TestMediaPolicyEnvBridge:
         home.mkdir()
         allow_dir = tmp_path / "reports"
         allow_dir.mkdir()
+        # NOTE: str(allow_dir), not !r — repr() doubles Windows backslashes
+        # inside a single-quoted YAML scalar ("C:\\Users"), so the parsed
+        # value would never match the real path.
         (home / "config.yaml").write_text(
             "gateway:\n"
             "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{str(allow_dir)!r}]\n"
+            f"  media_delivery_allow_dirs: ['{allow_dir}']\n"
             "  trust_recent_files: false\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
@@ -263,10 +266,13 @@ class TestMediaPolicyEnvBridge:
         # allowlist can accept it, proving the bridge ran.
         old = 1_600_000_000
         os.utime(media, (old, old))
+        # NOTE: quoted str, not !r — repr() doubles Windows backslashes
+        # inside a single-quoted YAML scalar ("C:\\Users"), so the parsed
+        # value would never match the real path.
         (home / "config.yaml").write_text(
             "gateway:\n"
             "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{str(allow_dir)!r}]\n"
+            f"  media_delivery_allow_dirs: ['{allow_dir}']\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
         for var in ("HERMES_MEDIA_DELIVERY_STRICT", "HERMES_MEDIA_ALLOW_DIRS"):
@@ -296,11 +302,14 @@ class TestMediaPolicyEnvBridge:
         home = tmp_path / "hermes-home"
         home.mkdir()
         media_dir = str(Path(media_file).parent)
+        # NOTE: quoted str, not !r — repr() doubles Windows backslashes
+        # inside a single-quoted YAML scalar ("C:\\Users"), so the parsed
+        # value would never match the real path.
         (home / "config.yaml").write_text(
             "platforms:\n  slack:\n    enabled: true\n    token: xoxb-test\n"
             "gateway:\n"
             "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{media_dir!r}]\n"
+            f"  media_delivery_allow_dirs: ['{media_dir}']\n"
             "  trust_recent_files: false\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))

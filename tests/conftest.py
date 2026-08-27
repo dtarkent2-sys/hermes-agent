@@ -284,6 +284,12 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION",
+    # Single-query CLI marker (hermes chat -q). Sits next to
+    # HERMES_GATEWAY_SESSION / HERMES_CRON_SESSION above: a pytest run
+    # launched from a kanban worker or -q shell inherits it and flips
+    # check_execute_code_guard into single-query deny, blocking every
+    # execute_code spawn-path test with KeyError('env') (#t_1a5b0689).
+    "HERMES_SINGLE_QUERY_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
     "HERMES_MODEL",

@@ -763,6 +763,7 @@ class TestHeadTailTruncation(unittest.TestCase):
         self.assertIn("execute_code stdout was truncated", result["warning"])
 
 
+@unittest.skipIf(sys.platform == "win32", "socket.socketpair(AF_UNIX) unavailable on Windows")
 class TestRpcTokenAuthorization(unittest.TestCase):
     """The per-session RPC token must gate socket dispatch (fail-closed).
 
