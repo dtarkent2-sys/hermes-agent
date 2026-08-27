@@ -42,6 +42,10 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_DB",
+    # Worker-exit state dir (sentinel + clean-exit channel): delegate
+    # children never write exit state, so scrub it from their env like the
+    # other dispatcher-owned vars (drift-guard registration, t_6db38d4a).
+    "HERMES_KANBAN_WORKER_EXIT_DIR",
 )
 
 

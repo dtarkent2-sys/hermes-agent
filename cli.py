@@ -20162,6 +20162,43 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _record_kanban_worker_clean_exit() -> None:
+    """Persist a kanban worker's clean exit (rc=0) for the dispatcher.
+
+    Called from BOTH single-query exit paths (``-Q`` quiet and plain ``-q``)
+    immediately before the process ends with exit code 0. Writes exit_code=0
+    to the per-run state file via the same cross-platform channel the
+    sentinel codes (75/76) already use.
+
+    Why this matters: on Windows the dispatcher's POSIX reap loop is a no-op
+    and the ``os.WIF*`` helpers do not exist, so a clean worker exit used to
+    be indistinguishable from a crash — every dead worker collapsed to
+    "unknown" and clean-exit protocol violations were mislabeled as generic
+    "pid not alive" crashes, bypassing the violation-only retry budget
+    (t_6db38d4a). POSIX reaping still populates the wait-status registry;
+    this file merely mirrors the same answer there. A crash path never
+    reaches the call sites (they run only after a successful conversation
+    turn, right before a rc=0 exit), so a recorded 0 is proof of a clean
+    exit. Never raises: a write failure must not change the exit code.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    try:
+        from hermes_cli.kanban_db import (
+            record_worker_exit_code as _rec_clean,
+        )
+        _run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+        if _run_id:
+            _rec_clean(
+                int(_run_id),
+                0,
+                None,
+                pid=os.getpid(),
+            )
+    except Exception:
+        pass
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -20795,6 +20832,12 @@ def main(
                                             )
                                     except Exception:
                                         pass
+                        else:
+                            # Cross-platform CLEAN-exit channel (see
+                            # _record_kanban_worker_clean_exit): the -Q
+                            # worker finished its turn successfully; record
+                            # the clean exit before sys.exit(0).
+                            _record_kanban_worker_clean_exit()
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
@@ -20821,6 +20864,14 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                # Kanban worker clean-exit observability (see
+                # _record_kanban_worker_clean_exit): plain `-q` workers take
+                # THIS path, not the -Q branch above — the dispatcher's
+                # _default_spawn builds `chat -q <prompt>` without -Q for
+                # non-goal workers. The -q single-query path returns rc=0
+                # from main() without ever entering the -Q exit-code block,
+                # so the clean-exit record must be written here too.
+                _record_kanban_worker_clean_exit()
         finally:
             _finalize_single_query(cli)
         return
