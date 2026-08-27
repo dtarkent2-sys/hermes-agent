@@ -531,12 +531,15 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
     assert kb.goal_run_status(
         conn, task_id, successor.current_run_id
     ) == "running"
-    assert not kb.block_task(
-        conn,
-        task_id,
-        reason="stale reviewer must not block successor",
-        expected_run_id=review.current_run_id,
-    )
+    # t_d19e1eeb: a contested stale pin raises RunGateMismatch instead of
+    # silently returning False — the no-mutation invariant is unchanged.
+    with pytest.raises(kb.RunGateMismatch):
+        kb.block_task(
+            conn,
+            task_id,
+            reason="stale reviewer must not block successor",
+            expected_run_id=review.current_run_id,
+        )
     current = kb.get_task(conn, task_id)
     assert current is not None
     assert current.status == "running"

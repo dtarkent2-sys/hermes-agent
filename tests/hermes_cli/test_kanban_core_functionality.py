@@ -403,7 +403,13 @@ def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch):
 
 
 def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatch):
-    """Stale retry attempts cannot mutate the active run lifecycle."""
+    """Stale retry attempts cannot mutate the active run lifecycle.
+
+    t_d19e1eeb: a contested stale pin now raises RunGateMismatch (an
+    actionable diagnostic) instead of silently returning False — the
+    no-mutation invariant is unchanged, the misdiagnosis ("unknown id or
+    not running") is gone.
+    """
     import hermes_cli.kanban_db as _kb
 
     conn = kb.connect()
@@ -420,8 +426,10 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
 
-        assert not kb.heartbeat_worker(conn, tid, note="late", expected_run_id=run1.id)
-        assert not kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
+        with pytest.raises(_kb.RunGateMismatch):
+            kb.heartbeat_worker(conn, tid, note="late", expected_run_id=run1.id)
+        with pytest.raises(_kb.RunGateMismatch):
+            kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.current_run_id == run2.id

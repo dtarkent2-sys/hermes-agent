@@ -1838,6 +1838,180 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Stale run-id gate (t_d19e1eeb): a worker whose run ended mid-conversation
+# (request_review / reclaim / crash) keeps HERMES_KANBAN_RUN_ID in its env;
+# the mutating tools must treat the pin as advisory when no successor run
+# is live, raise a precise RunGateMismatch when it is contested, and never
+# report the misleading "unknown id" for this state.
+# ---------------------------------------------------------------------------
+
+
+def _claim_and_get_run(conn, tid):
+    """Claim ``tid`` as a local worker and return (claimed task id, run_id)."""
+    host = kb._claimer_id().split(":", 1)[0]
+    assert kb.claim_task(conn, tid, claimer=f"{host}:w") is not None
+    run_id = kb.get_task(conn, tid).current_run_id
+    assert run_id is not None
+    return run_id
+
+
+def test_stale_run_pin_complete_succeeds_when_no_successor_run(kanban_home):
+    """The t_125207c9 run-538 repro: request_review ends the run, the worker
+    keeps its env pin, then completes. The pin is advisory — completion must
+    succeed, not report 'unknown id or already terminal'."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale pin", assignee="engineer")
+        run_id = _claim_and_get_run(conn, tid)
+        # request_review ends the run server-side (run 538 → review).
+        ok, reason = kb.request_review(
+            conn, tid, summary="handoff", expected_run_id=run_id,
+            with_reason=True,
+        )
+        assert ok, reason
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.current_run_id is None
+        # The same worker (env pin still = run_id) now completes.
+        assert kb.complete_task(
+            conn, tid, summary="done",
+            expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_stale_run_pin_block_succeeds_when_no_successor_run(kanban_home):
+    """Same class for kanban_block: the post-review worker must be able to
+    block instead of being told 'not in running/ready'."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale pin block", assignee="engineer")
+        run_id = _claim_and_get_run(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="handoff", expected_run_id=run_id,
+        ) is True
+        # Human unblocks back to ready → still blockable, pin still stale.
+        assert kb.unblock_task(conn, tid) is False  # review isn't blocked
+        # Force the review lane back to ready via reopen, then claim+end again
+        assert kb.reopen_review_task(conn, tid) is True
+        assert kb.complete_task(
+            conn, tid, summary="closing from stale pin",
+            expected_run_id=run_id,
+        ) is True
+
+
+def test_stale_run_pin_heartbeat_succeeds_when_no_successor_run(kanban_home):
+    """heartbeat_worker with a pin on the task's own ended run (no live run)
+    is refused by the running-status gate (task is in review), NOT by a
+    run-id join mismatch — and the error path must stay False, not raise."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale pin hb", assignee="engineer")
+        run_id = _claim_and_get_run(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="handoff", expected_run_id=run_id,
+        ) is True
+        # Task is in 'review' (not running) → heartbeat returns False cleanly.
+        assert kb.heartbeat_worker(
+            conn, tid, expected_run_id=run_id,
+        ) is False
+
+
+def test_contested_run_pin_raises_run_gate_mismatch(kanban_home):
+    """block/heartbeat with a pin referencing an ended run while a SUCCESSOR
+    run is live must not mutate the successor's run — RunGateMismatch naming
+    both runs, not a misleading 'unknown id'. complete_task is deliberately
+    exempt (allow_contested — the card's own task, see
+    test_stale_run_pin_complete_succeeds_when_no_successor_run and the
+    review-pending completion test)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="contested pin", assignee="engineer")
+        old_run = _claim_and_get_run(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="handoff", expected_run_id=old_run,
+        ) is True
+        # Reviewer claims → a NEW live run exists (claim from the review lane).
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_review_task(conn, tid, claimer=f"{host}:reviewer")
+        assert claimed is not None
+        new_run = kb.get_task(conn, tid).current_run_id
+        assert new_run is not None and new_run != old_run
+        with pytest.raises(kb.RunGateMismatch):
+            kb.block_task(
+                conn, tid, reason="stale must not block successor",
+                expected_run_id=old_run,
+            )
+        with pytest.raises(kb.RunGateMismatch):
+            kb.heartbeat_worker(conn, tid, expected_run_id=old_run)
+        # The successor run was NOT mutated by the stale-pin caller.
+        assert kb.get_task(conn, tid).status == "running"
+        # The live run's own pin still works.
+        assert kb.complete_task(
+            conn, tid, summary="reviewer closes", expected_run_id=new_run,
+        ) is True
+
+
+def test_stale_pin_complete_allowed_while_review_run_pending(kanban_home):
+    """The card's option-2 contract: complete_task with an ended-run pin is
+    advisory even when a successor review run is pending — completing one's
+    own task must never be wedged by request_review's mid-conversation run
+    end (mirrors the verified env -u CLI escape)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="complete during review", assignee="engineer")
+        old_run = _claim_and_get_run(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="handoff", expected_run_id=old_run,
+        ) is True
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_review_task(conn, tid, claimer=f"{host}:reviewer") is not None
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.complete_task(
+            conn, tid, summary="implementer closes during review",
+            expected_run_id=old_run,
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_healthy_run_pin_still_gated(kanban_home):
+    """The healthy path is unchanged: a pin matching the live run passes the
+    gate, a pin matching a DIFFERENT task's run (hallucinated id) must not
+    complete someone else's task."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="healthy pin", assignee="engineer")
+        run_id = _claim_and_get_run(conn, tid)
+        assert kb.complete_task(
+            conn, tid, summary="ok", expected_run_id=run_id,
+        ) is True
+
+    with kb.connect() as conn:
+        tid2 = kb.create_task(conn, title="foreign pin", assignee="engineer")
+        kb.claim_task(conn, tid2)
+        # A pin that never existed on this task while a live run exists is
+        # CONTESTED (a caller claiming a run id it was never given must not
+        # complete the live worker's task) — RunGateMismatch, not silent OK.
+        with pytest.raises(kb.RunGateMismatch):
+            kb.complete_task(
+                conn, tid2, summary="foreign pin contested",
+                expected_run_id=999_999,
+            )
+        assert kb.get_task(conn, tid2).status == "running"
+
+
+def test_stale_run_pin_schedule_task_succeeds(kanban_home):
+    """schedule_task's run-id gate gets the same advisory treatment."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale pin sched", assignee="engineer")
+        run_id = _claim_and_get_run(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="handoff", expected_run_id=run_id,
+        ) is True
+        # review is not in schedule_task's source statuses; unblock-ish path:
+        # reopen to ready, then schedule with the stale pin.
+        assert kb.reopen_review_task(conn, tid) is True
+        assert kb.schedule_task(
+            conn, tid, reason="later", expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+
+# ---------------------------------------------------------------------------
 # reap_worker_zombies() tests
 # ---------------------------------------------------------------------------
 

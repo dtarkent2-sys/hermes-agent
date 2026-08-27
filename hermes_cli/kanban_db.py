@@ -4450,6 +4450,108 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+class RunGateMismatch(ValueError):
+    """A worker's pinned run id no longer matches the task's live run.
+
+    Raised by :func:`_resolve_run_gate` when ``expected_run_id`` references
+    an ended run AND a successor run is live for the same task. The caller
+    (tool layer) surfaces ``str(exc)`` so the worker gets an actionable
+    diagnostic instead of a misleading ``unknown id`` error.
+    """
+
+    def __init__(self, task_id: str, expected_run_id: int, live_run_id: int):
+        self.task_id = task_id
+        self.expected_run_id = expected_run_id
+        self.live_run_id = live_run_id
+        super().__init__(
+            f"stale run id: your run {expected_run_id} on {task_id} has "
+            f"ended (e.g. review was requested or the run was reclaimed) "
+            f"and live run {live_run_id} owns the task now. Your env's "
+            f"HERMES_KANBAN_RUN_ID is stale — retry via the CLI with the "
+            f"var unset (`env -u HERMES_KANBAN_RUN_ID hermes kanban ...`), "
+            f"or leave the task to run {live_run_id}'s worker."
+        )
+
+
+def _resolve_run_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+    *,
+    allow_contested: bool = False,
+) -> Optional[int]:
+    """Resolve a worker's run-id ownership pin to the gate SQL should use.
+
+    A dispatcher-spawned worker pins its run id via ``HERMES_KANBAN_RUN_ID``
+    and every mutating tool passes it as ``expected_run_id`` so a stale or
+    buggy worker can't clobber someone else's run. The gate breaks the
+    moment the worker's own run ends mid-conversation — ``request_review``
+    (t_125207c9 / run 538→541, 2026-08-27), reclaim, crash, timeout — and
+    the naive ``AND current_run_id = ?`` join returns rowcount 0, which the
+    tool layer rendered as the misleading "unknown id or already terminal".
+    The worker then looks protocol-violating when it's actually locked out
+    of its own task.
+
+    Resolution (inside the caller's write txn):
+      * ``None`` → pass through; no pin, the status gate alone applies.
+      * pin == live run id → pass through unchanged (the healthy path).
+      * pin references an ENDED run of this task:
+          - ``allow_contested=True`` (``complete_task``) → always advisory:
+            the caller owns the task it just closed; drop the pin so the
+            status gate decides. This is the t_125207c9 case — completing
+            one's own task while its review run is pending is legitimate
+            (same path the ``env -u`` CLI workaround already allowed).
+          - otherwise → advisory only when NO successor run is live; when a
+            successor run IS live the pin is contested and
+            :class:`RunGateMismatch` is raised (a stale retry must never
+            block/heartbeat/schedule a successor worker's live run).
+      * pin references a run that never existed on this task → same split:
+        contested when a live run exists (raise), advisory when not.
+    """
+    if expected_run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        # Unknown task — let the caller's status gate produce the usual
+        # "unknown id" outcome.
+        return int(expected_run_id)
+    live_run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+    if live_run_id == int(expected_run_id):
+        return int(expected_run_id)
+    if allow_contested:
+        # complete_task: the pin proves former ownership of this task's run
+        # lifecycle (or is harmless); the status gate alone decides. An
+        # ended-run pin must never wedge the worker out of finishing its
+        # own card, even while a review successor is pending.
+        ended = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if ended is not None:
+            return None
+        # Foreign pin on a live task stays contested — no ownership proof.
+        if live_run_id is not None:
+            raise RunGateMismatch(task_id, int(expected_run_id), live_run_id)
+        return None
+    ended = conn.execute(
+        "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+        "AND ended_at IS NOT NULL",
+        (int(expected_run_id), task_id),
+    ).fetchone()
+    if ended is not None and live_run_id is None:
+        # The run this worker pinned is closed and no successor is live:
+        # the pin is merely stale, not contested. Drop it.
+        return None
+    if live_run_id is not None:
+        raise RunGateMismatch(task_id, int(expected_run_id), live_run_id)
+    # Pin doesn't resolve to any run of this task (hallucinated / foreign id)
+    # and there's no live run: treat the pin as unsatisfiable but harmless —
+    # drop it and let the status gate answer.
+    return None
+
+
 def _synthesize_ended_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5499,12 +5601,20 @@ def complete_task(
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
+        # Resolve the worker's run-id pin against the live run BEFORE the
+        # status CAS. complete_task treats an ended-run pin as advisory even
+        # when a review successor is pending (the caller owns the task it
+        # just closed — t_d19e1eeb); a foreign pin contested by a live run
+        # raises RunGateMismatch. See _resolve_run_gate.
+        gate_run_id = _resolve_run_gate(
+            conn, task_id, expected_run_id, allow_contested=True,
+        )
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
-        if expected_run_id is None:
+        if gate_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5537,7 +5647,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, task_id, int(gate_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -6355,6 +6465,10 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        # Resolve the worker's run-id pin against the live run (see
+        # _resolve_run_gate): a stale pin on an ended run with no successor
+        # is advisory; a contested pin raises RunGateMismatch.
+        gate_run_id = _resolve_run_gate(conn, task_id, expected_run_id)
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -6383,9 +6497,9 @@ def block_task(
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                """ + ("" if gate_run_id is None else " AND current_run_id = ?"),
+                (kind, task_id) if gate_run_id is None
+                else (kind, task_id, int(gate_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6441,9 +6555,9 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                """ + ("" if gate_run_id is None else " AND current_run_id = ?"),
+                (kind, recurrences, task_id) if gate_run_id is None
+                else (kind, recurrences, task_id, int(gate_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6468,7 +6582,7 @@ def block_task(
                 run_id=run_id,
             )
         else:
-            if expected_run_id is None:
+            if gate_run_id is None:
                 cur = conn.execute(
                     """
                     UPDATE tasks
@@ -6497,7 +6611,7 @@ def block_task(
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (kind, recurrences, task_id, int(gate_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -6577,6 +6691,12 @@ def request_review(
     — otherwise the request is refused instead of silently clearing the live
     worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
     their own run id as ``expected_run_id`` (unchanged).
+
+    The run-id gate is resolved through :func:`_resolve_run_gate`: a worker
+    pinning an ENDED run of its own task (the post-``request_review``
+    conversation continues with a stale ``HERMES_KANBAN_RUN_ID``) is treated
+    as advisory, while a pin contested by a live successor run raises
+    :class:`RunGateMismatch`.
 
     Returns ``bool`` by default. With ``with_reason=True`` returns
     ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
@@ -6680,7 +6800,8 @@ def request_review(
             return _ret(
                 False,
                 "task is not in running/ready (or expected_run_id did not "
-                "match the current run)",
+                "match the current run — if this worker's run was already "
+                "ended by a prior request_review, no new request is needed)",
             )
         run_id = _end_run(
             conn,
@@ -7991,6 +8112,10 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        # Resolve the worker's run-id pin against the live run (see
+        # _resolve_run_gate): a stale pin on an ended run with no successor
+        # is advisory; a contested pin raises RunGateMismatch.
+        gate_run_id = _resolve_run_gate(conn, task_id, expected_run_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8001,9 +8126,9 @@ def schedule_task(
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
-        if expected_run_id is not None:
+        if gate_run_id is not None:
             sql += " AND current_run_id = ?"
-            params.append(int(expected_run_id))
+            params.append(int(gate_run_id))
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
@@ -8247,17 +8372,19 @@ def _classify_worker_exit(
       something else, or died between reap tick and liveness check). Fall
       back to existing crashed-counter behavior.
 
-    The two sentinel kinds are recognised from two sources, consulted in
-    this order:
+    The two sentinel kinds and the clean exit are recognised from two
+    sources, consulted in this order:
 
     1. **The cross-platform worker-exit state file** (keyed by ``run_id``),
-       written by the worker right before it exits with a sentinel code.
-       This is the ONLY source that works on Windows, where
+       written by the worker right before it exits — sentinel codes for the
+       two bail-out reasons, and ``0`` on the normal-completion path. This
+       is the ONLY source that works on Windows, where
        ``reap_worker_zombies`` is a no-op and the ``os.WIF*`` helpers do not
-       exist. Because a worker only ever records the two sentinel codes
-       here, a state file can NEVER misclassify a genuine crash — a real
-       crash (exit 1/2, a signal) leaves no state file, so this step is a
-       no-op for it and the crash is still counted.
+       exist. Because a worker only ever records a sentinel code or a clean
+       0 here, a state file can NEVER misclassify a genuine crash — a real
+       crash (exit 1/2, a signal) never reaches the write site and leaves no
+       state file, so this step is a no-op for it and the crash is still
+       counted.
     2. **The POSIX wait-status registry** (``_recent_worker_exits``,
        populated by the reap loop on POSIX). Authoritative where reaping is
        live; it also covers a sentinel exit for which the worker failed to
@@ -8277,6 +8404,17 @@ def _classify_worker_exit(
             return ("rate_limited", state_code)
         if state_code == KANBAN_PROVIDER_OUTAGE_EXIT_CODE:
             return ("provider_outage", state_code)
+        if state_code == 0:
+            # Clean-exit record: the worker reached the normal end of its
+            # single-query path and persisted exit_code=0 immediately before
+            # ``sys.exit(0)``. On Windows this is the ONLY clean-exit signal
+            # the dispatcher ever sees (the POSIX reap registry below never
+            # populates there); on POSIX it merely duplicates the registry's
+            # answer, which is harmless. A genuine crash never reaches the
+            # write site, so a recorded 0 is proof of a clean exit — the
+            # same write-then-exit trust the sentinel codes above already
+            # rely on.
+            return ("clean_exit", 0)
     # 2. POSIX wait-status registry (authoritative where reaping is live).
     #    Decoded without os.WIF*: those helpers are absent on Windows, and
     #    letting the AttributeError collapse every classified exit into
@@ -8339,17 +8477,22 @@ def reap_worker_zombies() -> "list[int]":
 # exactly the 2026-08-24 10:54 incident (and the same pre-existing gap also
 # blinds the sentinel-75 rate-limit path on this host).
 #
-# This channel is the cross-platform replacement: a kanban worker that bails
-# on one of the two *sentinel* failure reasons (``rate_limit`` / ``billing``
-# -> 75, or a transient provider outage -> 76) persists its chosen exit code
-# + failure_reason to a per-run state file before ``sys.exit``; the
+# This channel is the cross-platform replacement: a kanban worker persists
+# its exit outcome to a per-run state file before ``sys.exit`` — the two
+# *sentinel* failure reasons (``rate_limit`` / ``billing`` -> 75, or a
+# transient provider outage -> 76), and ``0`` on the normal-completion path
+# (the Windows clean-exit observability fix, t_6db38d4a: without a recorded
+# clean exit, a Windows dispatcher — whose reap loop is a no-op and whose
+# ``os.WIF*`` helpers do not exist — could not distinguish a clean exit from
+# a crash and mislabeled every dead worker "pid not alive"). The
 # dispatcher's crash-detect pass reads that file first and falls back to the
 # POSIX wait-status registry only when the file is absent. Because a worker
-# only ever writes a sentinel file on the sentinel paths, this can NEVER
-# misclassify a genuine crash (exit 1/2, a signal) — a real crash leaves no
-# file, so the dispatcher sees ``unknown`` and counts the failure exactly as
-# before. The file is keyed by the run id, which is unique per attempt, so a
-# retried task's new run cannot be shadowed by the previous attempt's state.
+# only ever writes a sentinel code or a clean 0 here, this can NEVER
+# misclassify a genuine crash (exit 1/2, a signal) — a real crash never
+# reaches the write site and leaves no file, so the dispatcher sees
+# ``unknown`` and counts the failure exactly as before. The file is keyed by
+# the run id, which is unique per attempt, so a retried task's new run
+# cannot be shadowed by the previous attempt's state.
 # ---------------------------------------------------------------------------
 _WORKER_EXIT_STATE_TTL_SECONDS = 600
 
@@ -8448,6 +8591,45 @@ def read_worker_exit_code(
         return (code, reason)
     except Exception:
         return (None, None)
+
+
+def prune_worker_exit_state(max_age_seconds: Optional[int] = None) -> int:
+    """Delete expired per-run worker-exit state files.
+
+    Every worker exit now persists a state file (sentinels and clean exits
+    alike), so the shared ``worker_exits`` dir grows by one tiny JSON file
+    per worker run. The reader's TTL guard already makes stale files
+    inert — this sweep is the counterpart that actually removes them.
+    Called from ``_dispatch_once_locked`` each tick: bounded work, never
+    raises, and the file channel's correctness does not depend on it (a
+    file that survives until the next sweep is simply ignored by the TTL
+    guard).
+
+    Returns the number of files removed.
+    """
+    try:
+        exit_dir = _worker_exit_dir()
+        if not exit_dir.is_dir():
+            return 0
+        if max_age_seconds is None:
+            max_age_seconds = _WORKER_EXIT_STATE_TTL_SECONDS
+        cutoff = time.time() - max(0, int(max_age_seconds))
+        removed = 0
+        for entry in exit_dir.iterdir():
+            if not entry.name.startswith("run_") or not entry.name.endswith(".json"):
+                # Leave foreign files (and .tmp leftovers) alone.
+                continue
+            try:
+                if entry.stat().st_mtime <= cutoff:
+                    entry.unlink()
+                    removed += 1
+            except OSError:
+                # File vanished mid-sweep or is locked (Windows) — a later
+                # tick will try again; never let the sweep raise.
+                continue
+        return removed
+    except Exception:
+        return 0
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -8652,7 +8834,11 @@ def heartbeat_worker(
     """
     now = int(time.time())
     with write_txn(conn):
-        if expected_run_id is None:
+        # Resolve the worker's run-id pin against the live run (see
+        # _resolve_run_gate): a stale pin on an ended run with no successor
+        # is advisory; a contested pin raises RunGateMismatch.
+        gate_run_id = _resolve_run_gate(conn, task_id, expected_run_id)
+        if gate_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
                 "WHERE id = ? AND status = 'running'",
@@ -8662,13 +8848,13 @@ def heartbeat_worker(
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
                 "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                (now, task_id, int(gate_run_id)),
             )
         if cur.rowcount != 1:
             return False
         run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
+            int(gate_run_id)
+            if gate_run_id is not None
             else _current_run_id(conn, task_id)
         )
         if run_id is not None:
@@ -10293,6 +10479,11 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # Sweep expired per-run worker-exit state files. Every worker exit
+    # (sentinel AND clean) now persists one, so without this the shared
+    # worker_exits dir grows unboundedly; the reader's TTL guard keeps the
+    # channel correct either way — this is hygiene, not correctness.
+    prune_worker_exit_state()
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)

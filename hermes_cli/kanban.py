@@ -1514,7 +1514,11 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             expected_run_id=_worker_run_id_for(args.task_id),
         )
     if not ok:
-        print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
+        print(
+            f"cannot heartbeat {args.task_id} (unknown id, or the task is "
+            f"not running — check `hermes kanban show {args.task_id}`)",
+            file=sys.stderr,
+        )
         return 1
     print(f"Heartbeat recorded for {args.task_id}")
     return 0
@@ -2292,15 +2296,30 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                _completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.RunGateMismatch as gate_err:
+                # A contested stale env pin (t_d19e1eeb) — print the
+                # actionable diagnostic instead of a traceback.
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(f"kanban: {gate_err}", file=sys.stderr)
+                continue
+            if not _completed:
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid} (unknown id, or the task is not "
+                    f"in a completable state — check `hermes kanban show "
+                    f"{tid}`; if this worker's run was already ended by "
+                    f"request-review/reclaim, retry with the env var unset: "
+                    f"env -u HERMES_KANBAN_RUN_ID hermes kanban ...)",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2344,15 +2363,30 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                _blocked = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.RunGateMismatch as gate_err:
+                # A contested stale env pin (t_d19e1eeb) — print the
+                # actionable diagnostic instead of a traceback.
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                print(f"kanban: {gate_err}", file=sys.stderr)
+                continue
+            if not _blocked:
+                failed.append(tid)
+                print(
+                    f"cannot block {tid} (unknown id, or the task is not in "
+                    f"a blockable running/ready state — check `hermes kanban "
+                    f"show {tid}`; if this worker's run was already ended, "
+                    f"retry with the env var unset: "
+                    f"env -u HERMES_KANBAN_RUN_ID hermes kanban ...)",
+                    file=sys.stderr,
+                )
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.

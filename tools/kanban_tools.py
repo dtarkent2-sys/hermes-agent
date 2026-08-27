@@ -799,9 +799,17 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
+            except kb.RunGateMismatch as gate_err:
+                # The worker's pinned run id is contested by a live
+                # successor run — a precise, actionable diagnostic instead
+                # of the misleading "unknown id" (t_d19e1eeb).
+                return tool_error(f"kanban_complete: {gate_err}")
             if not ok:
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    f"could not complete {tid} (unknown id, or the task is "
+                    f"not in a completable state — check kanban_show; if "
+                    f"your run was already ended by request_review/reclaim, "
+                    f"retry via the CLI with HERMES_KANBAN_RUN_ID unset)"
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
@@ -873,8 +881,10 @@ def _handle_block(args: dict, **kw) -> str:
             )
             if not ok:
                 return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"could not block {tid} (unknown id, or the task is not in "
+                    f"a blockable running/ready state — check kanban_show; if "
+                    f"your run was already ended by request_review/reclaim, "
+                    f"retry via the CLI with HERMES_KANBAN_RUN_ID unset)"
                 )
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
@@ -886,6 +896,11 @@ def _handle_block(args: dict, **kw) -> str:
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
             )
+        except kb.RunGateMismatch as gate_err:
+            # Stale env run id contested by a live successor run — precise
+            # diagnostic instead of the misleading "not in running/ready"
+            # (the task IS running; it's the run-id join that fails).
+            return tool_error(f"kanban_block: {gate_err}")
         finally:
             conn.close()
     except ValueError as e:
@@ -953,7 +968,10 @@ def _handle_request_review(args: dict, **kw) -> str:
                 with_reason=True,
             )
             if not ok:
-                detail = fail_reason or "unknown id or not in running/ready"
+                detail = fail_reason or (
+                    "unknown id or not in running/ready — check kanban_show; "
+                    "if your run was already ended, request_review is not needed"
+                )
                 return tool_error(
                     f"could not request review for {tid}: {detail}"
                 )
@@ -1063,9 +1081,16 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             )
             if not ok:
                 return tool_error(
-                    f"could not heartbeat {tid} (unknown id or not running)"
+                    f"could not heartbeat {tid} (unknown id, or the task is "
+                    f"not running — check kanban_show; if your run was "
+                    f"already ended by request_review/reclaim, the heartbeat "
+                    f"is not needed)"
                 )
             return _ok(task_id=tid)
+        except kb.RunGateMismatch as gate_err:
+            # Stale env run id contested by a live successor run — precise
+            # diagnostic instead of the misleading "not running".
+            return tool_error(f"kanban_heartbeat: {gate_err}")
         finally:
             conn.close()
     except ValueError as e:
