@@ -289,6 +289,21 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    # Block-loop escalation parks human-in-the-loop cards in ``triage`` with
+    # ``block_kind`` still set (kanban_db.block_task routes to triage at
+    # BLOCK_RECURRENCE_LIMIT and deliberately preserves block_kind; it is
+    # cleared only on completion). Such a card awaits a HUMAN decision —
+    # decomposing it would spawn workers against an unresolved escalation.
+    # The auto-decomposer tick retries every dispatcher cycle with no
+    # backoff, so a fail here loops forever (observed: 174 failed aux-LLM
+    # calls in one morning on a David-pending escalation card). Fail
+    # fast — before any LLM call — and let the caller skip at debug level.
+    if task.block_kind:
+        return DecomposeOutcome(
+            task_id, False,
+            f"task is block-loop-parked in triage awaiting human input "
+            f"(block_kind={task.block_kind!r}); not a decompose candidate",
+        )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -311,6 +326,31 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
+    # The auto-decomposer runs on the gateway dispatcher thread, where no
+    # per-turn secret scope is installed. Under profile multiplexing
+    # (gateway.multiplex_profiles: true) get_secret() fails closed on
+    # unscoped reads, so every aux call raised UnscopedSecretError
+    # (OPENAI_API_KEY) and the tick retried forever. Install the home
+    # profile's scope around the call — the same fix the cron scheduler
+    # got for the identical failure mode (see cron/scheduler.py, which
+    # wraps run_job in set_secret_scope for the same reason). Harmless on
+    # single-profile installs: with multiplexing off, a scope miss falls
+    # through to os.environ (legacy behavior).
+    scope_token = None
+    try:
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            reset_secret_scope,
+            set_secret_scope,
+        )
+        from hermes_constants import get_hermes_home
+
+        scope_token = set_secret_scope(
+            build_profile_secret_scope(get_hermes_home())
+        )
+    except Exception:
+        scope_token = None  # unscoped fallback — never block decompose here
+
     try:
         # Route through call_llm so auxiliary.kanban_decomposer.* config
         # (provider/model/base_url, extra_body, reasoning_effort, retries)
@@ -331,6 +371,9 @@ def decompose_task(
             "decompose: API call failed for %s (%s)", task_id, exc,
         )
         return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+    finally:
+        if scope_token is not None:
+            reset_secret_scope(scope_token)
 
     try:
         raw = resp.choices[0].message.content or ""

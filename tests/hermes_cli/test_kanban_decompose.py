@@ -161,3 +161,85 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_skips_block_loop_parked_triage_task(kanban_home):
+    """Block-loop escalation parks human-in-the-loop cards in triage with
+    block_kind set. The decomposer must refuse them BEFORE any aux-LLM
+    call — otherwise the gateway auto-decompose tick (no backoff) retries
+    the doomed call every dispatcher cycle (observed: ~1 failed call/min
+    for hours on a David-pending escalation card)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ESCALATE to David", triage=True)
+        # Simulate the block_task() triage-parking path: status triage with
+        # block_kind preserved (cleared only on completion).
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'needs_input', block_recurrences = 2 "
+            "WHERE id = ?",
+            (tid,),
+        )
+
+    llm_calls = []
+
+    def _spy_call_llm(**kwargs):
+        llm_calls.append(kwargs)
+        return _fake_aux_response(jsonlib.dumps({"fanout": False}))
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=_spy_call_llm):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "block-loop-parked" in outcome.reason
+    assert "needs_input" in outcome.reason
+    # The refusal must happen before the LLM call — that is the whole point.
+    assert llm_calls == []
+
+
+def test_decompose_installs_secret_scope_around_aux_call(kanban_home):
+    """Under multiplexing the dispatcher thread has no per-turn secret
+    scope, so get_secret() fails closed and every auto-decompose aux call
+    raised UnscopedSecretError. decompose_task must install the home
+    profile scope around the call (mirrors cron/scheduler.py) and reset
+    it afterwards."""
+    from agent.secret_scope import current_secret_scope
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="scope check", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Scoped title",
+        "body": "Body.",
+        "assignee": None,
+    })
+    scope_during_call = {}
+
+    def _spy_call_llm(**kwargs):
+        scope_during_call["scope"] = current_secret_scope()
+        return _fake_aux_response(llm_payload)
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=_spy_call_llm):
+            outcome = decomp.decompose_task(tid, author="me")
+        scope_after_call = current_secret_scope()
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    # A scope was active inside the aux call (empty dict is fine in a test
+    # home — the invariant is scope presence, not contents).
+    assert scope_during_call["scope"] is not None
+    # And it was reset afterwards, not leaked into the caller's context.
+    assert scope_after_call is None
+
+
