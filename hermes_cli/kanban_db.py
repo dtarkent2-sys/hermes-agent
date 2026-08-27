@@ -6692,11 +6692,15 @@ def request_review(
     worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
     their own run id as ``expected_run_id`` (unchanged).
 
-    The run-id gate is resolved through :func:`_resolve_run_gate`: a worker
-    pinning an ENDED run of its own task (the post-``request_review``
-    conversation continues with a stale ``HERMES_KANBAN_RUN_ID``) is treated
-    as advisory, while a pin contested by a live successor run raises
-    :class:`RunGateMismatch`.
+    Unlike :func:`block_task` / :func:`schedule_task`, this transition does
+    NOT route ``expected_run_id`` through :func:`_resolve_run_gate`: the raw
+    value is applied directly as an ``AND current_run_id = ?`` guard. A
+    worker pinning an ended run (the post-``request_review`` conversation
+    continues with a stale ``HERMES_KANBAN_RUN_ID``) therefore gets ``False``
+    plus the "expected_run_id did not match the current run" diagnostic —
+    neither the advisory drop nor :class:`RunGateMismatch` applies here, by
+    design: a second request from an already-ended run is a no-op, and the
+    review lane must not be enterable by a run that has lost ownership.
 
     Returns ``bool`` by default. With ``with_reason=True`` returns
     ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a

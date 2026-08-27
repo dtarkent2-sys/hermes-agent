@@ -1880,22 +1880,102 @@ def test_stale_run_pin_complete_succeeds_when_no_successor_run(kanban_home):
 
 
 def test_stale_run_pin_block_succeeds_when_no_successor_run(kanban_home):
-    """Same class for kanban_block: the post-review worker must be able to
-    block instead of being told 'not in running/ready'."""
+    """Same class for kanban_block: after the implementer's run ends
+    (request_review) and the review lane is reopened back to ready, the
+    stale-pinned worker's block_task is advisory — it must succeed and land
+    the task in blocked instead of failing on the run-id join."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="stale pin block", assignee="engineer")
         run_id = _claim_and_get_run(conn, tid)
         assert kb.request_review(
             conn, tid, summary="handoff", expected_run_id=run_id,
         ) is True
-        # Human unblocks back to ready → still blockable, pin still stale.
-        assert kb.unblock_task(conn, tid) is False  # review isn't blocked
-        # Force the review lane back to ready via reopen, then claim+end again
+        # A second request_review from the same stale-pinned session is
+        # refused with a diagnostic, never a RunGateMismatch (the raw-guard
+        # contract is pinned by test_stale_pin_request_review_refused_not_advisory).
+        ok, reason = kb.request_review(
+            conn, tid, summary="retry from stale pin",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert ok is False and reason
+        # Human reopens the review lane back to ready; the env pin still
+        # references the ended run and no successor run is live.
         assert kb.reopen_review_task(conn, tid) is True
-        assert kb.complete_task(
-            conn, tid, summary="closing from stale pin",
+        assert kb.get_task(conn, tid).status == "ready"
+        # The coverage gap the pre-2026-08 version of this test left:
+        # block_task itself, called with the stale pin.
+        assert kb.block_task(
+            conn, tid, reason="needs operator input",
             expected_run_id=run_id,
         ) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+
+
+def test_stale_pin_block_succeeds_after_reclaim(kanban_home):
+    """Reclaim variant of the advisory gate (the dispatcher's crash-recovery
+    path): reclaim_task ends the live run and restores 'ready'; the worker's
+    env pin now references that ended run with no successor run live, so
+    block_task must be advisory here too."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="stale pin after reclaim", assignee="engineer",
+        )
+        run_id = _claim_and_get_run(conn, tid)
+        assert kb.reclaim_task(
+            conn, tid, reason="operator reclaim", signal_fn=lambda *a: None,
+        ) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert kb.block_task(
+            conn, tid, reason="worker reports back after reclaim",
+            expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_stale_pin_schedule_succeeds_after_reclaim(kanban_home):
+    """schedule_task twin of the advisory gate: the same stale-pin-after-
+    reclaim state must let the worker park the task in scheduled."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="stale pin schedule", assignee="engineer",
+        )
+        run_id = _claim_and_get_run(conn, tid)
+        assert kb.reclaim_task(
+            conn, tid, reason="operator reclaim", signal_fn=lambda *a: None,
+        ) is True
+        assert kb.schedule_task(
+            conn, tid, reason="waiting on external data",
+            expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+
+def test_stale_pin_request_review_refused_not_advisory(kanban_home):
+    """Pins the run-id contract documented on request_review: unlike
+    block/schedule/heartbeat it does NOT resolve the pin through
+    _resolve_run_gate. A stale pin on an ended run (post-reclaim here, so
+    the status gate alone would admit the call) is refused by the raw
+    ``AND current_run_id = ?`` guard — False + diagnostic, the task stays
+    out of the review lane, and RunGateMismatch is never raised here."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rr stale pin", assignee="engineer")
+        run_id = _claim_and_get_run(conn, tid)
+        assert kb.reclaim_task(
+            conn, tid, reason="operator reclaim", signal_fn=lambda *a: None,
+        ) is True
+        ok, reason = kb.request_review(
+            conn, tid, summary="stale pin must not enter the review lane",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert ok is False
+        assert "expected_run_id" in reason
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"  # NOT moved to review
+        assert task.current_run_id is None
 
 
 def test_stale_run_pin_heartbeat_succeeds_when_no_successor_run(kanban_home):
