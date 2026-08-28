@@ -114,4 +114,4 @@ for name in subprocess.run(
 
 subprocess.run(["git", "diff", "--check"], check=True)
 print("resolver complete")
-# trigger after whitespace-gate removal
+# trigger after force-publish workflow fix
