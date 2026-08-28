@@ -4,6 +4,7 @@ import pytest
 
 from agent.codex_responses_adapter import (
     _chat_messages_to_responses_input,
+    _sanitize_replayed_fn_name,
     _format_responses_error,
     _normalize_codex_response,
     _neutralize_harmony_tokens,
@@ -227,6 +228,39 @@ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
     assert assistant_message.codex_reasoning_items is None
 
 
+# ---------------------------------------------------------------------------
+# Server-side built-in tool calls (xAI native web_search, code interpreter,
+# etc.) come back as discrete ``*_call`` output items that xAI's
+# /v1/responses surface routinely leaves at ``status="in_progress"`` even
+# when the overall ``response.status == "completed"``.  These must NOT mark
+# the turn incomplete — otherwise grok-composer-2.5-fast research queries
+# (which invoke server-side web_search) get misclassified as
+# ``finish_reason="incomplete"`` and burn 3 fruitless continuation retries
+# before failing with "Codex response remained incomplete after 3
+# continuation attempts".  Observed live against grok-composer-2.5-fast on
+# SuperGrok OAuth (2026-06).
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Replayed assistant message items with an oversized server-assigned ``id``
+# (Codex issues 400+ char base64 blobs) must never reach the API — the
+# Responses endpoint caps input[].id at 64 chars and rejects the whole
+# request with a non-retryable HTTP 400, permanently bricking the session
+# (every subsequent turn replays the same bad id). Short ids (msg_...) are
+# still worth keeping for prefix-cache hits, so this is a length guard, not
+# a blanket strip.
+# ---------------------------------------------------------------------------
+
+_OVERSIZED_ITEM_ID = "x" * 408
+_VALID_ITEM_ID = "msg_abc123"
+
+
+# The codex app-server overflows the Responses 64-char call_id limit for
+# MCP-routed tools, e.g. codex_mcp__hermes-tools__web_search_exec-<uuid> (#73492).
+_OVERSIZED_CALL_ID = "codex_mcp__hermes-tools__web_search_exec-" + "0" * 43
+
+
 def test_chat_messages_to_responses_input_clamps_oversized_call_id():
     """An oversized call_id must be clamped to <=64 chars on BOTH the
     function_call and its matching function_call_output, to the same surrogate,
@@ -286,6 +320,129 @@ def test_chat_messages_to_responses_input_keeps_short_call_id():
     output = next(i for i in items if i.get("type") == "function_call_output")
     assert call["call_id"] == "call_abc123"
     assert output["call_id"] == "call_abc123"
+
+
+def test_sanitize_replayed_fn_name_valid_passthrough():
+    """Valid names pass through unchanged (identity — cache-prefix safe)."""
+    for name in ("web_search", "exec-command", "a1_B2-c3", "x" * 64):
+        assert _sanitize_replayed_fn_name(name) == name
+
+
+def test_sanitize_replayed_fn_name_coerces_invalid_chars():
+    assert _sanitize_replayed_fn_name("exec.command") == "exec_command"
+    assert _sanitize_replayed_fn_name("run shell cmd") == "run_shell_cmd"
+    assert _sanitize_replayed_fn_name("weird..__name") == "weird_name"
+    assert _sanitize_replayed_fn_name("  tool!  ") == "tool"
+
+
+def test_sanitize_replayed_fn_name_degenerate_inputs():
+    """All-invalid / non-string names degrade to a placeholder, never empty —
+    an empty name would trade the API 400 for a preflight ValueError."""
+    assert _sanitize_replayed_fn_name("") == "fn"
+    assert _sanitize_replayed_fn_name("...") == "fn"
+    assert _sanitize_replayed_fn_name("日本語") == "fn"
+    assert _sanitize_replayed_fn_name(None) == "fn"
+    assert len(_sanitize_replayed_fn_name("a." * 100)) <= 64
+
+
+def test_chat_messages_to_responses_input_sanitizes_replayed_fn_name():
+    """A degenerate tool name stored in history must not brick the replay
+    with a non-retryable 400 (#31666)."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "call_id": "call_abc123",
+                    "function": {"name": "exec.command", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_abc123",
+            "content": "some result",
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    call = next(i for i in items if i.get("type") == "function_call")
+    output = next(i for i in items if i.get("type") == "function_call_output")
+    assert call["name"] == "exec_command"
+    # Pairing is by call_id and must survive the rename.
+    assert call["call_id"] == output["call_id"] == "call_abc123"
+
+
+def test_chat_messages_to_responses_input_canonicalizes_fc_only_pair():
+    """A legacy fc_-only stored id must map the paired function_call and
+    function_call_output to the SAME call_id — including the oversized case
+    where both sides clamp to the same surrogate (#49224)."""
+    for fc_id in ("fc_short123", "fc_" + "a" * 64):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": fc_id,
+                        "function": {"name": "web_search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": fc_id,
+                "content": "some result",
+            },
+        ]
+
+        items = _chat_messages_to_responses_input(messages)
+
+        call = next(i for i in items if i.get("type") == "function_call")
+        output = next(i for i in items if i.get("type") == "function_call_output")
+        assert call["call_id"] == output["call_id"]
+        assert len(call["call_id"]) <= 64
+
+
+def test_preflight_codex_input_items_sanitizes_replayed_fn_name():
+    """The preflight choke-point also coerces invalid replayed names
+    (covers callers that build input items without the chat converter)."""
+    normalized = _preflight_codex_input_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bad name!",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ]
+    )
+    call = next(i for i in normalized if i.get("type") == "function_call")
+    assert call["name"] == "bad_name"
+
+
+def test_preflight_codex_api_kwargs_leaves_tool_definition_names_alone():
+    """Live tool schema names must NOT be rewritten — they have to match the
+    dispatch registry exactly. Sanitization is replay-only."""
+    kwargs = _preflight_codex_api_kwargs(
+        {
+            "model": "gpt-5-codex",
+            "instructions": "x",
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "my_tool",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+    )
+    assert kwargs["tools"][0]["name"] == "my_tool"
 
 
 def test_preflight_codex_input_items_drops_short_id_for_github_responses():
@@ -352,6 +509,15 @@ def test_preflight_passes_native_web_search_tool_through():
     assert any(t.get("type") == "function" and t.get("name") == "read_file" for t in tools)
 
 
+# ---------------------------------------------------------------------------
+# _format_responses_error — adapted from anomalyco/opencode#28757.
+# Provider failures should surface BOTH the code (rate_limit_exceeded /
+# context_length_exceeded / internal_error / server_error) and the message,
+# so consumers can tell rate limits apart from context-length failures and
+# both apart from generic stream drops.
+# ---------------------------------------------------------------------------
+
+
 def test_format_responses_error_message_only():
     err = {"message": "Upstream model unavailable"}
     assert _format_responses_error(err, "failed") == "Upstream model unavailable"
@@ -375,6 +541,18 @@ def test_normalize_codex_response_failed_includes_code_in_error():
     )
     with pytest.raises(RuntimeError, match=r"^rate_limit_exceeded: Slow down$"):
         _normalize_codex_response(response)
+
+
+# ---------------------------------------------------------------------------
+# Reasoning-channel answer salvage (xAI grok) — grok-4.x on the xAI
+# /v1/responses surface sometimes emits its final answer inside the
+# reasoning item, delimited by grok's internal "<response>" tag, with no
+# ``message`` output item at all.  Because those reasoning items carry no
+# encrypted_content, the interim message replays as nothing and every
+# continuation request is byte-identical — the turn burns 3 retries and
+# fails even though the answer was produced.  Observed live with grok-4.20
+# on xai-oauth (2026-07-13).
+# ---------------------------------------------------------------------------
 
 
 def _xai_reasoning_only_response(reasoning_text):
